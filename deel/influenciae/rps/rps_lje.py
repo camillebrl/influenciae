@@ -55,7 +55,10 @@ class RepresenterPointLJE(BaseRepresenterPoint):
 
         # In the paper, the authors explain that in practice, they use a single step of SGD to compute the
         # perturbed model's weights. We will do the same here.
-        optimizer = tf.keras.optimizers.SGD(learning_rate=1e-4)
+        try:
+            optimizer = tf.keras.optimizers.SGD(learning_rate=1e-4)
+        except TypeError:
+            optimizer = tf.keras.optimizers.legacy.SGD(learning_rate=1e-4)
         target_layer_shape = influence_model.model.layers[target_layer].input.type_spec.shape
         perturbed_head = tf.keras.models.clone_model(self.original_head)
         perturbed_head.set_weights(self.original_head.get_weights())
@@ -115,8 +118,8 @@ class RepresenterPointLJE(BaseRepresenterPoint):
         """
         # First, we compute the second term, which contains the Hessian vector product
         weights = self.perturbed_head.trainable_weights
-        with tf.GradientTape(persistent=False, watch_accessed_variables=False) as tape:
-            tape.watch(weights)
+        # Use watch_accessed_variables=True for Keras 3.x compatibility
+        with tf.GradientTape(persistent=False) as tape:
             logits = self.perturbed_head(z_batch)
             loss = self.perturbed_head.compiled_loss(y_batch, logits)
         grads = tape.jacobian(loss, weights)[0]

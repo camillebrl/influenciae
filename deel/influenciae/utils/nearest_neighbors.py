@@ -147,25 +147,24 @@ class LinearNearestNeighbors(BaseNearestNeighbors):
         if batch_size is None:
             batch_size = tf.shape(vector_to_find)[0]
 
-        dataset_iterator = iter(self.dataset)
         self.batched_sorted_dict.reset()
 
-        def body_func(i):
-            batch, ihvp = next(dataset_iterator)
+        # Use eager iteration instead of tf.while_loop to avoid autograph tracing
+        # issues with Keras 3.x KerasVariable objects
+        for batch, ihvp in self.dataset:
             influence_values = self.dot_product_fun(vector_to_find, ihvp)
+
+            # Ensure influence values are finite
+            influence_values = tf.where(
+                tf.math.is_finite(influence_values),
+                influence_values,
+                tf.zeros_like(influence_values)
+            )
 
             self.batched_sorted_dict.add_all(
                 tf.repeat(tf.expand_dims(batch[0], axis=0), batch_size, axis=0),
                 influence_values
             )
-
-            return (i+1, )
-
-        tf.while_loop(
-            cond=lambda i: i < self.dataset.cardinality(),
-            body=body_func,
-            loop_vars=[tf.constant(0, dtype=tf.int64)]
-        )
 
         training_samples, influences_values = self.batched_sorted_dict.get()
 

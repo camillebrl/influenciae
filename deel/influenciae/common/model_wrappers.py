@@ -112,7 +112,6 @@ class BaseInfluenceModel:
         return self.model.layers
 
     @staticmethod
-    @tf.function
     def _loss(
         model: tf.keras.Model,
         loss_function: Callable,
@@ -143,8 +142,7 @@ class BaseInfluenceModel:
         return loss_function(y_true, model(model_inp), sample_weight)
 
     @staticmethod
-    @tf.function
-    def _jacobian(model: tf.keras.Model, weights: tf.Tensor, loss_function: Callable,
+    def _jacobian(model: tf.keras.Model, weights: List[tf.Variable], loss_function: Callable,
                   batch: Tuple[tf.Tensor, ...], process_batch_for_loss_fn: ProcessBatchTypeAlias) -> tf.Tensor:
         """
         Computes the model's jacobian for a single batch of samples.
@@ -153,6 +151,8 @@ class BaseInfluenceModel:
         ----------
         model
             The model used for computing the influence score.
+        weights
+            The list of model weights to compute gradients for.
         loss_function
             The reduction-less loss function to calculate the influence (e.g. cross-entropy).
         batch
@@ -168,11 +168,16 @@ class BaseInfluenceModel:
         """
         model_inp, y_true, sample_weight = process_batch_for_loss_fn(batch)
         batch_size = tf.shape(y_true)[0]
-        with tf.GradientTape(watch_accessed_variables=False) as tape:
-            tape.watch(weights)
+
+        # Use watch_accessed_variables=True to automatically track all variables
+        # This is compatible with both tf.Variable and keras.Variable (Keras 3.x)
+        with tf.GradientTape(persistent=True) as tape:
             y_pred = loss_function(y_true, model(model_inp), sample_weight)
 
+        # Get jacobians for the specified weights
+        # For Keras 3.x variables, we need to access their underlying value
         jacobian = tape.jacobian(y_pred, weights)
+        del tape
 
         jacobian = [tf.reshape(j, (batch_size, -1,)) for j in jacobian]
         jacobian = tf.concat(jacobian, axis=1)
@@ -180,8 +185,7 @@ class BaseInfluenceModel:
         return jacobian
 
     @staticmethod
-    @tf.function
-    def _gradient(model: tf.keras.Model, weights: tf.Variable, loss_function: Callable,
+    def _gradient(model: tf.keras.Model, weights: List[tf.Variable], loss_function: Callable,
                   batch: Tuple[tf.Tensor, ...], process_batch_for_loss_fn: ProcessBatchTypeAlias) -> tf.Tensor:
         """
         Computes the model gradients for a single batch of sample.
@@ -190,6 +194,8 @@ class BaseInfluenceModel:
         ----------
         model
             The model used for computing the influence score.
+        weights
+            The list of model weights to compute gradients for.
         loss_function
             Reduction-less loss function to calculate the influence (e.g. cross-entropy).
         batch
@@ -204,8 +210,9 @@ class BaseInfluenceModel:
             The gradient vector for the set of inputs.
         """
         model_inp, y_true, sample_weight = process_batch_for_loss_fn(batch)
-        with tf.GradientTape(watch_accessed_variables=False) as tape:
-            tape.watch(weights)
+        # Use watch_accessed_variables=True to automatically track all variables
+        # This is compatible with both tf.Variable and keras.Variable (Keras 3.x)
+        with tf.GradientTape() as tape:
             y_pred = tf.expand_dims(loss_function(y_true, model(model_inp), sample_weight), axis=-1)
 
         gradients = tape.gradient(y_pred, weights)
@@ -256,7 +263,6 @@ class BaseInfluenceModel:
 
         return loss_values
 
-    @tf.function
     def batch_jacobian_tensor(self, batch: Tuple[tf.Tensor, ...]) -> tf.Tensor:
         """
         Computes the jacobian of the loss wrt the weights of the start_layer on a Tensor
@@ -303,7 +309,6 @@ class BaseInfluenceModel:
 
         return jacobians
 
-    @tf.function
     def batch_gradient_tensor(self, batch: Tuple[tf.Tensor, ...]) -> tf.Tensor:
         """
         Computes the gradient of the loss wrt the weights of the start_layer on a Tensor

@@ -167,7 +167,7 @@ class SelfInfluenceCalculator:
         load_or_save_path
             The path to save the dataset
         """
-        tf.data.experimental.save(dataset, load_or_save_path)
+        tf.data.save(dataset, load_or_save_path)
 
     def _load_dataset(self, dataset_path: str) -> tf.data.Dataset:
         """
@@ -184,7 +184,7 @@ class SelfInfluenceCalculator:
             The target dataset
         """
         if path.exists(dataset_path):
-            dataset = tf.data.experimental.load(dataset_path)
+            dataset = tf.data.load(dataset_path)
         else:
             raise NotFoundErr(f"The dataset path: {dataset_path} was not found")
         return dataset
@@ -410,21 +410,76 @@ class BaseInfluenceCalculator(SelfInfluenceCalculator):
         if influence_vector_in_cache == CACHE.MEMORY:
             inf_vect_ds = inf_vect_ds.cache()
 
-        batch_size_eval = int(dataset_to_evaluate._batch_size)  # pylint: disable=W0212
-        nearest_neighbors.build(
-            inf_vect_ds,
-            self._estimate_influence_value_from_influence_vector,
-            k,
-            query_batch_size=batch_size_eval,
-            d_type=d_type,
-            order=order,
-        )
+        # Iterate eagerly to avoid autograph tracing issues with Keras 3.x
+        results = []
+        for batch_evaluate in dataset_to_evaluate:
+            if not isinstance(batch_evaluate, tuple):
+                batch_evaluate = (batch_evaluate,)
 
-        top_k_dataset = dataset_to_evaluate.map(
-            lambda *batch_evaluate: self._top_k_with_inf_vect_dataset_train(
-                batch_evaluate, nearest_neighbors, batch_size_eval, device
+            # Get actual batch size from the data, not from dataset config
+            actual_batch_size = tf.shape(batch_evaluate[0])[0]
+
+            # Rebuild nearest neighbors for each batch with the correct size
+            nearest_neighbors.build(
+                inf_vect_ds,
+                self._estimate_influence_value_from_influence_vector,
+                k,
+                query_batch_size=int(actual_batch_size.numpy()),
+                d_type=d_type,
+                order=order,
             )
-        )
+
+            result = self._top_k_with_inf_vect_dataset_train(
+                batch_evaluate, nearest_neighbors, int(actual_batch_size.numpy()), device
+            )
+            results.append(result)
+
+        # Reconstruct dataset from results
+        # Convert any Variables to Tensors in results (BatchSort uses tf.Variable internally)
+        def convert_to_tensor(item):
+            if isinstance(item, tf.Variable):
+                return tf.identity(item)
+            elif isinstance(item, tf.Tensor):
+                return item
+            elif isinstance(item, tuple):
+                return tuple(convert_to_tensor(x) for x in item)
+            elif isinstance(item, list):
+                return [convert_to_tensor(x) for x in item]
+            elif isinstance(item, dict):
+                return {k: convert_to_tensor(v) for k, v in item.items()}
+            return item
+
+        results = [convert_to_tensor(r) for r in results]
+
+        def generator():
+            for r in results:
+                yield r
+
+        if len(results) > 0:
+            first_result = results[0]
+            # Build output signature with dynamic batch dimension
+            def get_tensor_spec(tensor):
+                if isinstance(tensor, (tf.Tensor, tf.Variable)):
+                    shape = list(tensor.shape)
+                    if len(shape) > 0:
+                        shape[0] = None
+                    return tf.TensorSpec(shape=shape, dtype=tensor.dtype)
+                return tensor
+
+            def nested_tensor_spec(nested):
+                if isinstance(nested, tuple):
+                    return tuple(nested_tensor_spec(x) for x in nested)
+                elif isinstance(nested, list):
+                    return [nested_tensor_spec(x) for x in nested]
+                elif isinstance(nested, dict):
+                    return {k: nested_tensor_spec(v) for k, v in nested.items()}
+                else:
+                    return get_tensor_spec(nested)
+
+            output_signature = nested_tensor_spec(first_result)
+            top_k_dataset = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
+        else:
+            top_k_dataset = dataset_to_evaluate
 
         if save_top_k_ds_path is not None:
             self._save_dataset(top_k_dataset, save_top_k_ds_path)
@@ -534,7 +589,6 @@ class BaseInfluenceCalculator(SelfInfluenceCalculator):
 
         return value
 
-    @tf.function
     def _estimate_individual_influence_values_from_batch(
             self,
             train_samples: Tuple[tf.Tensor, ...],

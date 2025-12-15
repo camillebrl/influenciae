@@ -83,7 +83,6 @@ class ArnoldiInfluenceCalculator(BaseInfluenceCalculator):
 
         return eig_vals, G
 
-    @tf.function
     def __build_orthogonal_basis_iter(
             self,
             W: tf.Tensor,

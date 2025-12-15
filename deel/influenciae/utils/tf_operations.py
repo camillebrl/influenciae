@@ -276,6 +276,9 @@ def map_to_device(dataset: tf.data.Dataset, map_fun: Callable, device: Optional[
     Performs a map function on the preferred device. If none is specified, the first available GPU is
     chosen, and if there aren't any, the computations are done on the CPU.
 
+    This function iterates eagerly over the dataset to avoid TensorFlow's autograph tracing,
+    which is incompatible with Keras 3.x KerasVariable objects.
+
     Parameters
     ----------
     dataset
@@ -294,9 +297,47 @@ def map_to_device(dataset: tf.data.Dataset, map_fun: Callable, device: Optional[
     """
     device = get_device(device)
 
-    def map_fun_device(*args):
+    # Collect results eagerly to avoid autograph tracing issues with Keras 3.x
+    results = []
+    for batch in dataset:
         with tf.device(device):
-            result = map_fun(*args)
-        return result
+            if isinstance(batch, tuple):
+                result = map_fun(*batch)
+            else:
+                result = map_fun(batch)
+            results.append(result)
 
-    return dataset.map(map_fun_device)
+    # Reconstruct dataset from results
+    if len(results) == 0:
+        return dataset
+
+    # Create dataset from generator to handle variable-sized outputs
+    def generator():
+        for r in results:
+            yield r
+
+    # Infer output signature from first result
+    first_result = results[0]
+
+    def get_tensor_spec(tensor):
+        if isinstance(tensor, tf.Tensor):
+            # Use None for the batch dimension to allow variable-sized batches
+            shape = list(tensor.shape)
+            if len(shape) > 0:
+                shape[0] = None  # Dynamic batch size
+            return tf.TensorSpec(shape=shape, dtype=tensor.dtype)
+        return tensor
+
+    def nested_tensor_spec(nested):
+        if isinstance(nested, tuple):
+            return tuple(nested_tensor_spec(x) for x in nested)
+        elif isinstance(nested, list):
+            return [nested_tensor_spec(x) for x in nested]
+        elif isinstance(nested, dict):
+            return {k: nested_tensor_spec(v) for k, v in nested.items()}
+        else:
+            return get_tensor_spec(nested)
+
+    output_signature = nested_tensor_spec(first_result)
+
+    return tf.data.Dataset.from_generator(generator, output_signature=output_signature)

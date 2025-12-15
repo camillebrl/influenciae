@@ -17,7 +17,7 @@ from tensorflow.keras.models import Sequential  # pylint: disable=E0611
 
 from .model_wrappers import BaseInfluenceModel, InfluenceModel
 
-from ..types import Optional, Union, Tuple, List, Callable
+from ..types import Optional, Union, Tuple, List, Callable, Dict
 from ..utils import assert_batched_dataset, conjugate_gradients_solve, map_to_device
 
 
@@ -182,8 +182,7 @@ class ExactIHVP(InverseHessianVectorProduct):
         else:
             raise ArgumentError("Either train_dataset or train_hessian can be set to None, but not both")
 
-    @tf.function
-    def _compute_inv_hessian(self, dataset: tf.data.Dataset, nb_batch: tf.int32) -> tf.Tensor:
+    def _compute_inv_hessian(self, dataset: tf.data.Dataset, nb_batch: int) -> tf.Tensor:
         """
         Compute the (pseudo)-inverse of the hessian matrix wrt to the model's parameters using
         backward-mode AD.
@@ -242,7 +241,6 @@ class ExactIHVP(InverseHessianVectorProduct):
 
         return tf.linalg.pinv(hessian)
 
-    @tf.function
     def _compute_ihvp_single_batch(self, group_batch: Tuple[tf.Tensor, ...], use_gradient: bool = True) -> tf.Tensor:
         """
         Computes the inverse-hessian-vector product of a group of points provided in the form of
@@ -271,7 +269,6 @@ class ExactIHVP(InverseHessianVectorProduct):
         ihvp = tf.matmul(self.inv_hessian, tf.cast(grads, dtype=self.inv_hessian.dtype), transpose_b=True)
         return ihvp
 
-    @tf.function
     def _compute_hvp_single_batch(self, group_batch: Tuple[tf.Tensor, ...], use_gradient: bool = True) -> tf.Tensor:
         """
         Computes the hessian-vector product of a group of points provided in the form of a tuple
@@ -381,7 +378,6 @@ class ForwardOverBackwardHVP:
             index += size
         return grads_reshape
 
-    @tf.function
     def _sub_call(
             self,
             x: tf.Tensor,
@@ -410,8 +406,8 @@ class ForwardOverBackwardHVP:
                 self.weights,
                 # The "vector" in Hessian-vector product.
                 x) as acc:
-            with tf.GradientTape(persistent=False, watch_accessed_variables=False) as tape:
-                tape.watch(self.weights)
+            # Use watch_accessed_variables=True for Keras 3.x compatibility
+            with tf.GradientTape(persistent=False) as tape:
                 loss = self.model.loss_function(y_hessian_current, self.model(feature_maps_hessian_current))
             backward = tape.jacobian(loss, self.weights)
         hessian_vector_product = acc.jvp(backward)
@@ -747,6 +743,1041 @@ class LissaIHVP(IterativeIHVP):
         return ihvp_result
 
 
+class FisherIHVP(InverseHessianVectorProduct):
+    """
+    A class that computes the inverse-hessian-vector product using the Fisher Information Matrix
+    (Gauss-Newton approximation) instead of the exact Hessian.
+
+    The Fisher/Gauss-Newton approximation is:
+        F = E[J^T J]  where J = ∂f/∂θ (Jacobian of model outputs w.r.t. parameters)
+
+    This approximation:
+    - Is always positive semi-definite (unlike the exact Hessian)
+    - Is faster to compute (no double backprop needed)
+    - Is equivalent to the Hessian when the model is at a local minimum with zero residuals
+
+    The inversion is done via LDL decomposition with Tikhonov regularization:
+        (F + λI)^{-1} v
+
+    Parameters
+    ----------
+    model
+        The TF2.X model implementing the InfluenceModel interface.
+    train_dataset
+        The TF dataset, already batched, containing the samples for computing the Fisher matrix.
+    damping
+        Tikhonov regularization parameter λ for numerical stability (default: 1e-4).
+    train_fisher
+        Optional pre-computed Fisher matrix. If provided, train_dataset can be None.
+    extractor_layer
+        Optional integer indicating the position of the last layer of the feature extraction network.
+        If provided, the model will be split into feature extractor and head.
+    feature_extractor
+        Optional pre-built feature extractor model. If not provided but extractor_layer is,
+        will be built from model.layers[:extractor_layer].
+
+    Notes
+    -----
+    Memory complexity: O(p²) where p = number of parameters
+    Time complexity: O(n*p*c) for computing F, O(p³) for inversion
+    where n = number of samples, c = number of outputs
+
+    Unlike ExactIHVP which computes ∂²L/∂θ² (requires double backprop),
+    this computes J^T J (only single backprop + matrix product).
+    """
+    def __init__(
+            self,
+            model: InfluenceModel,
+            train_dataset: Optional[tf.data.Dataset] = None,
+            damping: float = 1e-4,
+            train_fisher: Optional[tf.Tensor] = None,
+            extractor_layer: Optional[Union[int, str]] = None,
+            feature_extractor: Optional[Model] = None,
+    ):
+        super().__init__(model, train_dataset)
+        self.damping = damping
+        self.extractor_layer = extractor_layer
+        self._batch_shape_tensor = None
+
+        # Handle feature extractor setup if extractor_layer is provided
+        if extractor_layer is not None:
+            if feature_extractor is None:
+                self.feature_extractor = tf.keras.Sequential(model.model.layers[:extractor_layer])
+            else:
+                self.feature_extractor = feature_extractor
+
+            # Transform training dataset to feature maps
+            if train_dataset is not None:
+                train_dataset = self._compute_feature_map_dataset(train_dataset)
+
+            # Create a new model that operates on feature maps
+            self.model = BaseInfluenceModel(
+                tf.keras.Sequential(model.model.layers[extractor_layer:]),
+                weights_to_watch=model.weights,
+                loss_function=model.loss_function,
+                weights_processed=True
+            )
+        else:
+            self.feature_extractor = None
+
+        if train_dataset is not None:
+            self.fisher = self._compute_fisher(train_dataset)
+            self.inv_fisher = self._compute_inv_fisher(self.fisher, damping)
+        elif train_fisher is not None:
+            self.fisher = train_fisher
+            self.inv_fisher = self._compute_inv_fisher(train_fisher, damping)
+        else:
+            raise ArgumentError("Either train_dataset or train_fisher must be provided")
+
+    def _compute_feature_map_dataset(self, dataset: tf.data.Dataset) -> tf.data.Dataset:
+        """
+        Extracts the feature maps for an entire dataset.
+
+        Parameters
+        ----------
+        dataset
+            The TF dataset whose feature maps we wish to extract.
+
+        Returns
+        -------
+        feature_map_dataset
+            A TF dataset with the pairs (feature_maps, labels).
+        """
+        feature_map_dataset = map_to_device(dataset, lambda x_batch, y: (self.feature_extractor(x_batch), y)).cache()
+
+        if self._batch_shape_tensor is None:
+            self._batch_shape_tensor = tf.shape(next(iter(feature_map_dataset))[0])
+
+        return feature_map_dataset
+
+    def _compute_fisher(self, dataset: tf.data.Dataset) -> tf.Tensor:
+        """
+        Compute the Fisher Information Matrix (Gauss-Newton approximation).
+
+        F = (1/n) Σᵢ Jᵢ^T Jᵢ
+
+        where Jᵢ = ∂L_i/∂θ is the gradient of the loss for sample i.
+
+        Unlike the exact Hessian which requires ∂²L/∂θ² (jacobian of jacobian),
+        Fisher only needs the outer product of gradients: J^T J.
+
+        Parameters
+        ----------
+        dataset
+            Batched TF dataset for computing the Fisher matrix.
+
+        Returns
+        -------
+        fisher
+            The Fisher Information Matrix of shape (nb_params, nb_params).
+        """
+        nb_params = self.model.nb_params
+
+        # Initialize Fisher matrix
+        fisher = tf.zeros((nb_params, nb_params), dtype=tf.float32)
+        n_samples = 0
+
+        for batch in dataset:
+            # Get per-sample gradients (Jacobian of loss w.r.t. parameters)
+            # Shape: (batch_size, nb_params)
+            grads = self.model.batch_jacobian_tensor(batch)
+            grads = tf.reshape(grads, (-1, nb_params))
+            grads = tf.cast(grads, dtype=tf.float32)
+
+            # Replace NaN/Inf with zeros for numerical stability
+            grads = tf.where(tf.math.is_finite(grads), grads, tf.zeros_like(grads))
+
+            batch_size = tf.shape(grads)[0]
+            n_samples += batch_size
+
+            # Fisher = sum of outer products: J^T @ J
+            # This is the key difference from ExactIHVP which does jacobian(jacobian(...))
+            fisher += tf.matmul(grads, grads, transpose_a=True)
+
+        # Average over samples
+        fisher = fisher / tf.cast(n_samples, dtype=fisher.dtype)
+
+        # Ensure Fisher is symmetric and finite
+        fisher = (fisher + tf.transpose(fisher)) / 2.0
+        fisher = tf.where(tf.math.is_finite(fisher), fisher, tf.zeros_like(fisher))
+
+        return fisher
+
+    @staticmethod
+    def _compute_inv_fisher(fisher: tf.Tensor, damping: float) -> tf.Tensor:
+        """
+        Compute the inverse of the Fisher matrix with Tikhonov regularization.
+
+        Uses LDL decomposition for numerical stability (similar to nngeometry).
+
+        Parameters
+        ----------
+        fisher
+            The Fisher Information Matrix.
+        damping
+            Regularization parameter λ.
+
+        Returns
+        -------
+        inv_fisher
+            The regularized inverse: (F + λI)^{-1}
+        """
+        n = tf.shape(fisher)[0]
+        regularized_fisher = fisher + damping * tf.eye(n, dtype=fisher.dtype)
+
+        # Use pseudo-inverse for better numerical stability
+        # This handles rank-deficient or near-singular matrices gracefully
+        inv_fisher = tf.linalg.pinv(regularized_fisher)
+
+        # Ensure result is finite
+        inv_fisher = tf.where(tf.math.is_finite(inv_fisher), inv_fisher, tf.zeros_like(inv_fisher))
+
+        return inv_fisher
+
+    def solve(self, v: tf.Tensor, damping: Optional[float] = None) -> tf.Tensor:
+        """
+        Solve (F + λI)x = v for x without explicitly computing the inverse.
+
+        This is more numerically stable than computing F^{-1} @ v.
+
+        Parameters
+        ----------
+        v
+            The vector to solve for, shape (nb_params,) or (nb_params, k).
+        damping
+            Optional damping override (uses self.damping if None).
+
+        Returns
+        -------
+        x
+            The solution x = (F + λI)^{-1} v
+        """
+        if damping is None:
+            damping = self.damping
+
+        n = tf.shape(self.fisher)[0]
+        regularized_fisher = self.fisher + damping * tf.eye(n, dtype=self.fisher.dtype)
+
+        # Solve via Cholesky
+        v = tf.cast(v, dtype=regularized_fisher.dtype)
+        if len(v.shape) == 1:
+            v = tf.expand_dims(v, axis=-1)
+
+        try:
+            chol = tf.linalg.cholesky(regularized_fisher)
+            solution = tf.linalg.cholesky_solve(chol, v)
+        except tf.errors.InvalidArgumentError:
+            solution = tf.linalg.lstsq(regularized_fisher, v)
+
+        return tf.squeeze(solution)
+
+    def _compute_ihvp_single_batch(self, group_batch: Tuple[tf.Tensor, ...], use_gradient: bool = True) -> tf.Tensor:
+        """
+        Computes the inverse-Fisher-vector product for a batch of points.
+
+        Parameters
+        ----------
+        group_batch
+            A tuple containing the batch of inputs and labels.
+        use_gradient
+            If True, compute gradients of the loss; if False, use the input directly as vectors.
+
+        Returns
+        -------
+        ihvp
+            The inverse-Fisher-vector product, shape (nb_params, batch_size).
+        """
+        # Handle feature extraction if configured
+        if self.feature_extractor is not None and use_gradient:
+            feature_maps = self.feature_extractor(group_batch[0])
+            batch_for_grad = (feature_maps, *group_batch[1:])
+        else:
+            batch_for_grad = group_batch
+
+        if use_gradient:
+            grads = tf.reshape(self.model.batch_jacobian_tensor(batch_for_grad), (-1, self.model.nb_params))
+        else:
+            grads = tf.reshape(group_batch[0], (-1, self.model.nb_params))
+
+        # Replace NaN/Inf with zeros for numerical stability
+        grads = tf.cast(grads, dtype=self.inv_fisher.dtype)
+        grads = tf.where(tf.math.is_finite(grads), grads, tf.zeros_like(grads))
+
+        # F^{-1} @ grads^T
+        ihvp = tf.matmul(self.inv_fisher, grads, transpose_b=True)
+
+        # Ensure result is finite
+        ihvp = tf.where(tf.math.is_finite(ihvp), ihvp, tf.zeros_like(ihvp))
+
+        return ihvp
+
+    def _compute_hvp_single_batch(self, group_batch: Tuple[tf.Tensor, ...], use_gradient: bool = True) -> tf.Tensor:
+        """
+        Computes the Fisher-vector product for a batch of points.
+
+        Parameters
+        ----------
+        group_batch
+            A tuple containing the batch of inputs and labels.
+        use_gradient
+            If True, compute gradients of the loss; if False, use the input directly as vectors.
+
+        Returns
+        -------
+        hvp
+            The Fisher-vector product, shape (nb_params, batch_size).
+        """
+        # Handle feature extraction if configured
+        if self.feature_extractor is not None and use_gradient:
+            feature_maps = self.feature_extractor(group_batch[0])
+            batch_for_grad = (feature_maps, *group_batch[1:])
+        else:
+            batch_for_grad = group_batch
+
+        if use_gradient:
+            grads = tf.reshape(self.model.batch_jacobian_tensor(batch_for_grad), (-1, self.model.nb_params))
+        else:
+            grads = tf.reshape(group_batch[0], (-1, self.model.nb_params))
+
+        grads = tf.cast(grads, dtype=self.fisher.dtype)
+        grads = tf.where(tf.math.is_finite(grads), grads, tf.zeros_like(grads))
+
+        hvp = tf.matmul(self.fisher, grads, transpose_b=True)
+        hvp = tf.where(tf.math.is_finite(hvp), hvp, tf.zeros_like(hvp))
+
+        return hvp
+
+class KFACIHVP(InverseHessianVectorProduct):
+    """
+    Inverse Hessian-Vector Product calculator using Kronecker-Factored Approximate Curvature (KFAC).
+
+    KFAC approximates the Fisher Information Matrix as a block-diagonal matrix where each block
+    (corresponding to one layer) is approximated as a Kronecker product of two smaller matrices:
+
+    H_layer ≈ G ⊗ A
+
+    where:
+    - A is the input covariance matrix: A = E[a @ a^T] (size: in_features x in_features)
+    - G is the output gradient covariance: G = E[g @ g^T] (size: out_features x out_features)
+
+    This dramatically reduces memory from O(p²) to O(Σ(in_i² + out_i²)) where p is total params.
+
+    The key insight is that for a linear layer y = Wx + b:
+    - The gradient w.r.t. W is: ∂L/∂W = g @ a^T (outer product)
+    - The Fisher block is: E[(g ⊗ a)(g ⊗ a)^T] = E[gg^T] ⊗ E[aa^T] = G ⊗ A
+
+    Parameters
+    ----------
+    model
+        An InfluenceModel wrapping the TensorFlow model.
+    train_dataset
+        A batched TF dataset for computing the KFAC factors.
+    damping
+        Regularization parameter λ for numerical stability.
+
+    Attributes
+    ----------
+    kfac_blocks
+        Dictionary mapping layer index to (A, G) Kronecker factor pairs.
+    layer_shapes
+        Dictionary mapping layer index to (in_features, out_features) tuples.
+
+    Notes
+    -----
+    Memory complexity: O(Σ(in_i² + out_i²)) vs O(p²) for full Fisher
+    Time complexity: O(n * Σ(in_i * out_i)) for computing factors
+    Solve complexity: O(Σ(in_i³ + out_i³)) for Cholesky solves
+
+    References
+    ----------
+    Martens, J., & Grosse, R. (2015). Optimizing neural networks with Kronecker-factored
+    approximate curvature. ICML.
+    """
+
+    def __init__(
+            self,
+            model: InfluenceModel,
+            train_dataset: Optional[tf.data.Dataset] = None,
+            damping: float = 1e-3,
+    ):
+        super().__init__(model, train_dataset)
+        self.damping = damping
+
+        # Extract layer information from the model
+        self.layer_info = self._extract_layer_info()
+
+        if train_dataset is not None:
+            self.kfac_blocks = self._compute_kfac_blocks(train_dataset)
+        else:
+            raise ArgumentError("train_dataset must be provided for KFAC")
+
+    def _extract_layer_info(self) -> List[dict]:
+        """
+        Extract information about Dense layers in the model.
+
+        Returns
+        -------
+        layer_info
+            List of dictionaries with layer information (weights, shapes, etc.)
+        """
+        layer_info = []
+        weight_idx = 0
+
+        for layer in self.model.model.layers:
+            if isinstance(layer, tf.keras.layers.Dense):
+                weights = layer.get_weights()
+                if len(weights) >= 1:
+                    kernel = weights[0]  # Shape: (in_features, out_features)
+                    has_bias = len(weights) > 1
+
+                    in_features = kernel.shape[0]
+                    out_features = kernel.shape[1]
+
+                    # Count parameters for this layer
+                    n_params = in_features * out_features
+                    if has_bias:
+                        n_params += out_features
+
+                    layer_info.append({
+                        'layer': layer,
+                        'in_features': in_features,
+                        'out_features': out_features,
+                        'has_bias': has_bias,
+                        'weight_start_idx': weight_idx,
+                        'n_params': n_params,
+                    })
+                    weight_idx += n_params
+
+        return layer_info
+
+    def _compute_kfac_blocks(self, dataset: tf.data.Dataset) -> Dict[int, Tuple[tf.Tensor, tf.Tensor]]:
+        """
+        Compute KFAC factors (A, G) for each layer.
+
+        For each Dense layer:
+        - A = (1/n) Σ a_i @ a_i^T  (input covariance, with bias augmentation)
+        - G = (1/n) Σ g_i @ g_i^T  (output gradient covariance)
+
+        Parameters
+        ----------
+        dataset
+            Batched TF dataset for computing the factors.
+
+        Returns
+        -------
+        kfac_blocks
+            Dictionary mapping layer index to (A, G) tuples.
+        """
+        # Initialize accumulators for each layer
+        A_accum = {}
+        G_accum = {}
+        n_samples = 0
+
+        for layer_idx, info in enumerate(self.layer_info):
+            in_dim = info['in_features'] + (1 if info['has_bias'] else 0)
+            out_dim = info['out_features']
+            A_accum[layer_idx] = tf.zeros((in_dim, in_dim), dtype=tf.float32)
+            G_accum[layer_idx] = tf.zeros((out_dim, out_dim), dtype=tf.float32)
+
+        # Build intermediate models to get activations
+        layer_inputs = []
+        layer_outputs = []
+
+        for info in self.layer_info:
+            layer = info['layer']
+            # Get the input to this layer
+            layer_input_model = tf.keras.Model(
+                inputs=self.model.model.input,
+                outputs=layer.input
+            )
+            layer_inputs.append(layer_input_model)
+
+        # Process dataset
+        for batch in dataset:
+            inputs, labels, sample_weight = self.model.process_batch_for_loss_fn(batch)
+            batch_size = tf.shape(inputs)[0]
+            n_samples += batch_size
+
+            # Forward pass with gradient tape to get per-layer gradients
+            with tf.GradientTape(persistent=True) as tape:
+                # Get activations at each layer input
+                activations = [model(inputs) for model in layer_inputs]
+
+                # Watch activations to compute gradients w.r.t. them
+                for act in activations:
+                    tape.watch(act)
+
+                # Full forward pass
+                output = self.model.model(inputs)
+                loss_per_sample = self.model.loss_function(labels, output, sample_weight)
+                loss = tf.reduce_sum(loss_per_sample)
+
+            # Compute gradients w.r.t. each layer's output (pre-activation gradient)
+            for layer_idx, info in enumerate(self.layer_info):
+                layer = info['layer']
+                activation = activations[layer_idx]
+
+                # Compute output of this layer
+                layer_output = layer(activation)
+
+                # Gradient of loss w.r.t. layer output (this is 'g' in KFAC)
+                grad_output = tape.gradient(loss, layer_output)
+
+                if grad_output is None:
+                    continue
+
+                # A factor: input covariance
+                # Augment with 1 for bias
+                a = activation
+                if info['has_bias']:
+                    ones = tf.ones((batch_size, 1), dtype=a.dtype)
+                    a = tf.concat([a, ones], axis=1)
+
+                # Accumulate A = a^T @ a
+                A_accum[layer_idx] += tf.matmul(a, a, transpose_a=True)
+
+                # G factor: output gradient covariance
+                g = grad_output
+                # Accumulate G = g^T @ g
+                G_accum[layer_idx] += tf.matmul(g, g, transpose_a=True)
+
+            del tape
+
+        # Average and create blocks
+        kfac_blocks = {}
+        n_samples_float = tf.cast(n_samples, tf.float32)
+
+        for layer_idx in range(len(self.layer_info)):
+            A = A_accum[layer_idx] / n_samples_float
+            G = G_accum[layer_idx] / n_samples_float
+
+            # Ensure symmetric and finite
+            A = (A + tf.transpose(A)) / 2.0
+            G = (G + tf.transpose(G)) / 2.0
+            A = tf.where(tf.math.is_finite(A), A, tf.zeros_like(A))
+            G = tf.where(tf.math.is_finite(G), G, tf.zeros_like(G))
+
+            kfac_blocks[layer_idx] = (A, G)
+
+        return kfac_blocks
+
+    def _compute_pi_correction(self, A: tf.Tensor, G: tf.Tensor) -> float:
+        """
+        Compute pi correction factor for balanced damping.
+
+        pi = sqrt((trace(A) * dim(G)) / (trace(G) * dim(A)))
+
+        This balances the regularization between the two factors.
+
+        Parameters
+        ----------
+        A
+            Input covariance factor.
+        G
+            Output gradient covariance factor.
+
+        Returns
+        -------
+        pi
+            The correction factor.
+        """
+        trace_A = tf.linalg.trace(A)
+        trace_G = tf.linalg.trace(G)
+        dim_A = tf.cast(tf.shape(A)[0], tf.float32)
+        dim_G = tf.cast(tf.shape(G)[0], tf.float32)
+
+        # Avoid division by zero
+        trace_G = tf.maximum(trace_G, 1e-10)
+        dim_A = tf.maximum(dim_A, 1.0)
+
+        pi = tf.sqrt((trace_A * dim_G) / (trace_G * dim_A))
+        pi = tf.clip_by_value(pi, 1e-5, 1e5)  # Prevent extreme values
+
+        return float(pi.numpy())
+
+    def _solve_kfac_block(
+            self,
+            A: tf.Tensor,
+            G: tf.Tensor,
+            v_block: tf.Tensor,
+            damping: float
+    ) -> tf.Tensor:
+        """
+        Solve (G ⊗ A + λI) @ x = v for x using the Kronecker structure.
+
+        Using the property: (G ⊗ A)^{-1} = G^{-1} ⊗ A^{-1}
+        We solve: x = (A + sqrt(λ/pi) I)^{-1} @ V @ (G + sqrt(λ*pi) I)^{-T}
+
+        where V is v_block reshaped to (in_features, out_features).
+
+        Parameters
+        ----------
+        A
+            Input covariance factor.
+        G
+            Output gradient covariance factor.
+        v_block
+            Vector block for this layer (flattened).
+        damping
+            Regularization parameter.
+
+        Returns
+        -------
+        x_block
+            Solution vector (flattened).
+        """
+        in_dim = A.shape[0]
+        out_dim = G.shape[0]
+
+        # Compute pi correction
+        pi = self._compute_pi_correction(A, G)
+
+        # Add damping with pi correction
+        sqrt_damping = tf.sqrt(damping)
+        A_reg = A + (sqrt_damping / pi) * tf.eye(in_dim, dtype=A.dtype)
+        G_reg = G + (sqrt_damping * pi) * tf.eye(out_dim, dtype=G.dtype)
+
+        # Reshape v to matrix form (in_features, out_features)
+        V = tf.reshape(v_block, (in_dim, out_dim))
+
+        # Solve using two linear solves
+        # First solve: A_reg @ X_temp = V
+        X_temp = tf.linalg.solve(A_reg, V)
+
+        # Second solve: G_reg @ X^T = X_temp^T => X = (G_reg^{-1} @ X_temp^T)^T
+        X = tf.transpose(tf.linalg.solve(G_reg, tf.transpose(X_temp)))
+
+        # Flatten back
+        return tf.reshape(X, [-1])
+
+    def _compute_ihvp_single_batch(self, group_batch: Tuple[tf.Tensor, ...], use_gradient: bool = True) -> tf.Tensor:
+        """
+        Computes the inverse-KFAC-vector product for a batch of points.
+
+        Parameters
+        ----------
+        group_batch
+            A tuple containing the batch of inputs and labels.
+        use_gradient
+            If True, compute gradients of the loss; if False, use the input directly as vectors.
+
+        Returns
+        -------
+        ihvp
+            The inverse-KFAC-vector product, shape (nb_params, batch_size).
+        """
+        if use_gradient:
+            grads = self.model.batch_jacobian_tensor(group_batch)
+            grads = tf.reshape(grads, (-1, self.model.nb_params))
+        else:
+            grads = tf.reshape(group_batch[0], (-1, self.model.nb_params))
+
+        grads = tf.cast(grads, dtype=tf.float32)
+        grads = tf.where(tf.math.is_finite(grads), grads, tf.zeros_like(grads))
+
+        batch_size = tf.shape(grads)[0]
+        ihvp_list = []
+
+        # Process each sample in the batch
+        for i in range(batch_size):
+            grad = grads[i]
+            ihvp_sample = []
+
+            # Solve for each layer block
+            param_idx = 0
+            for layer_idx, info in enumerate(self.layer_info):
+                n_params = info['n_params']
+                v_block = grad[param_idx:param_idx + n_params]
+
+                A, G = self.kfac_blocks[layer_idx]
+                x_block = self._solve_kfac_block(A, G, v_block, self.damping)
+
+                ihvp_sample.append(x_block)
+                param_idx += n_params
+
+            ihvp_list.append(tf.concat(ihvp_sample, axis=0))
+
+        ihvp = tf.stack(ihvp_list, axis=0)
+        ihvp = tf.where(tf.math.is_finite(ihvp), ihvp, tf.zeros_like(ihvp))
+
+        return tf.transpose(ihvp)
+
+    def _compute_hvp_single_batch(self, group_batch: Tuple[tf.Tensor, ...], use_gradient: bool = True) -> tf.Tensor:
+        """
+        Computes the KFAC-vector product for a batch of points.
+
+        This is the forward operation: (G ⊗ A) @ v for each layer block.
+
+        Parameters
+        ----------
+        group_batch
+            A tuple containing the batch of inputs and labels.
+        use_gradient
+            If True, compute gradients of the loss; if False, use the input directly as vectors.
+
+        Returns
+        -------
+        hvp
+            The KFAC-vector product, shape (nb_params, batch_size).
+        """
+        if use_gradient:
+            grads = self.model.batch_jacobian_tensor(group_batch)
+            grads = tf.reshape(grads, (-1, self.model.nb_params))
+        else:
+            grads = tf.reshape(group_batch[0], (-1, self.model.nb_params))
+
+        grads = tf.cast(grads, dtype=tf.float32)
+        grads = tf.where(tf.math.is_finite(grads), grads, tf.zeros_like(grads))
+
+        batch_size = tf.shape(grads)[0]
+        hvp_list = []
+
+        # Process each sample in the batch
+        for i in range(batch_size):
+            grad = grads[i]
+            hvp_sample = []
+
+            # Apply KFAC product for each layer block
+            param_idx = 0
+            for layer_idx, info in enumerate(self.layer_info):
+                n_params = info['n_params']
+                v_block = grad[param_idx:param_idx + n_params]
+
+                A, G = self.kfac_blocks[layer_idx]
+                x_block = self._apply_kfac_block(A, G, v_block)
+
+                hvp_sample.append(x_block)
+                param_idx += n_params
+
+            hvp_list.append(tf.concat(hvp_sample, axis=0))
+
+        hvp = tf.stack(hvp_list, axis=0)
+        hvp = tf.where(tf.math.is_finite(hvp), hvp, tf.zeros_like(hvp))
+
+        return tf.transpose(hvp)
+
+    def _apply_kfac_block(
+            self,
+            A: tf.Tensor,
+            G: tf.Tensor,
+            v_block: tf.Tensor,
+    ) -> tf.Tensor:
+        """
+        Apply (G ⊗ A) @ v for a single layer block.
+
+        Using the property: (G ⊗ A) @ vec(V) = vec(A @ V @ G^T)
+
+        Parameters
+        ----------
+        A
+            Input covariance factor.
+        G
+            Output gradient covariance factor.
+        v_block
+            Vector block for this layer (flattened).
+
+        Returns
+        -------
+        result_block
+            Result vector (flattened).
+        """
+        in_dim = A.shape[0]
+        out_dim = G.shape[0]
+
+        # Reshape v to matrix form (in_features, out_features)
+        V = tf.reshape(v_block, (in_dim, out_dim))
+
+        # Apply: A @ V @ G^T
+        result = tf.matmul(A, tf.matmul(V, G, transpose_b=True))
+
+        # Flatten back
+        return tf.reshape(result, [-1])
+
+
+class EKFACIHVP(KFACIHVP):
+    """
+    Inverse Hessian-Vector Product calculator using Eigenvalue-corrected KFAC (EKFAC).
+
+    EKFAC improves upon KFAC by computing the true eigenvalues of the Fisher matrix
+    in the Kronecker-factored eigenbasis, rather than assuming they are products
+    of the individual factor eigenvalues.
+
+    The key insight is:
+    1. Eigendecompose A = U_A Λ_A U_A^T and G = U_G Λ_G U_G^T
+    2. The eigenvectors of G ⊗ A are columns of U_G ⊗ U_A (Kronecker product)
+    3. But eigenvalues are NOT λ_G × λ_A in general
+    4. EKFAC computes the true eigenvalues by projecting gradients to the eigenbasis
+
+    The corrected eigenvalues are computed as:
+    Λ_corrected[i,j] = (1/n) Σ_samples (g_kfe[i])² × (a_kfe[j])²
+
+    where g_kfe = U_G^T @ g and a_kfe = U_A^T @ a are the projections to eigenbasis.
+
+    Parameters
+    ----------
+    model
+        An InfluenceModel wrapping the TensorFlow model.
+    train_dataset
+        A batched TF dataset for computing the KFAC factors and eigenvalue corrections.
+    damping
+        Regularization parameter λ for numerical stability.
+    update_eigen
+        Whether to compute the eigenvalue corrections (True for full EKFAC).
+
+    Attributes
+    ----------
+    evecs
+        Dictionary mapping layer index to (U_A, U_G) eigenvector matrices.
+    evals
+        Dictionary mapping layer index to 2D eigenvalue matrices (out_dim, in_dim).
+
+    Notes
+    -----
+    EKFAC provides better approximation than KFAC at the cost of computing
+    eigendecompositions and an additional pass through the data.
+
+    References
+    ----------
+    George, T., et al. (2018). Fast Approximate Natural Gradient Descent
+    in a Kronecker-factored Eigenbasis. NeurIPS.
+    """
+
+    def __init__(
+            self,
+            model: InfluenceModel,
+            train_dataset: Optional[tf.data.Dataset] = None,
+            damping: float = 1e-3,
+            update_eigen: bool = True,
+    ):
+        # Initialize KFAC first
+        super().__init__(model, train_dataset, damping)
+
+        # Compute eigendecompositions of KFAC factors
+        self.evecs = {}
+        self.evals = {}
+
+        for layer_idx, (A, G) in self.kfac_blocks.items():
+            # Eigendecompose A and G
+            evals_A, evecs_A = tf.linalg.eigh(A)
+            evals_G, evecs_G = tf.linalg.eigh(G)
+
+            # Ensure non-negative eigenvalues (numerical issues)
+            evals_A = tf.maximum(evals_A, 0.0)
+            evals_G = tf.maximum(evals_G, 0.0)
+
+            self.evecs[layer_idx] = (evecs_A, evecs_G)
+
+            # Initial eigenvalues: outer product of factor eigenvalues
+            # Shape: (out_dim, in_dim)
+            self.evals[layer_idx] = tf.expand_dims(evals_G, 1) * tf.expand_dims(evals_A, 0)
+
+        # Update eigenvalues with true values if requested
+        if update_eigen and train_dataset is not None:
+            self._update_eigenvalues(train_dataset)
+
+    def _update_eigenvalues(self, dataset: tf.data.Dataset) -> None:
+        """
+        Compute corrected eigenvalues by projecting gradients to the eigenbasis.
+
+        For each sample, compute:
+        a_kfe = U_A^T @ a  (project input to eigenbasis)
+        g_kfe = U_G^T @ g  (project gradient to eigenbasis)
+
+        Then: Λ[i,j] = (1/n) Σ (g_kfe[i])² × (a_kfe[j])²
+
+        Parameters
+        ----------
+        dataset
+            Batched TF dataset for computing eigenvalue corrections.
+        """
+        # Initialize accumulators
+        evals_accum = {}
+        for layer_idx, info in enumerate(self.layer_info):
+            out_dim = info['out_features']
+            in_dim = info['in_features'] + (1 if info['has_bias'] else 0)
+            evals_accum[layer_idx] = tf.zeros((out_dim, in_dim), dtype=tf.float32)
+
+        n_samples = 0
+
+        # Build intermediate models
+        layer_inputs = []
+        for info in self.layer_info:
+            layer = info['layer']
+            layer_input_model = tf.keras.Model(
+                inputs=self.model.model.input,
+                outputs=layer.input
+            )
+            layer_inputs.append(layer_input_model)
+
+        # Process dataset
+        for batch in dataset:
+            inputs, labels, sample_weight = self.model.process_batch_for_loss_fn(batch)
+            batch_size = tf.shape(inputs)[0]
+            n_samples += batch_size
+
+            with tf.GradientTape(persistent=True) as tape:
+                activations = [model(inputs) for model in layer_inputs]
+                for act in activations:
+                    tape.watch(act)
+
+                output = self.model.model(inputs)
+                loss_per_sample = self.model.loss_function(labels, output, sample_weight)
+                loss = tf.reduce_sum(loss_per_sample)
+
+            for layer_idx, info in enumerate(self.layer_info):
+                layer = info['layer']
+                activation = activations[layer_idx]
+                layer_output = layer(activation)
+
+                grad_output = tape.gradient(loss, layer_output)
+                if grad_output is None:
+                    continue
+
+                evecs_A, evecs_G = self.evecs[layer_idx]
+
+                # Augment activation with bias term
+                a = activation
+                if info['has_bias']:
+                    ones = tf.ones((batch_size, 1), dtype=a.dtype)
+                    a = tf.concat([a, ones], axis=1)
+
+                g = grad_output
+
+                # Project to eigenbasis
+                a_kfe = tf.matmul(a, evecs_A)  # (batch, in_dim)
+                g_kfe = tf.matmul(g, evecs_G)  # (batch, out_dim)
+
+                # Compute eigenvalue contributions: (g_kfe²) ⊗ (a_kfe²)
+                # For each sample: outer product of squared projections
+                # Sum over batch
+                a_kfe_sq = tf.square(a_kfe)  # (batch, in_dim)
+                g_kfe_sq = tf.square(g_kfe)  # (batch, out_dim)
+
+                # Accumulate: Σ_batch g²[:, i] * a²[:, j] for all i,j
+                evals_contrib = tf.matmul(g_kfe_sq, a_kfe_sq, transpose_a=True)  # (out_dim, in_dim)
+                evals_accum[layer_idx] += evals_contrib
+
+            del tape
+
+        # Average eigenvalues
+        n_samples_float = tf.cast(n_samples, tf.float32)
+        for layer_idx in range(len(self.layer_info)):
+            self.evals[layer_idx] = evals_accum[layer_idx] / n_samples_float
+            # Ensure non-negative
+            self.evals[layer_idx] = tf.maximum(self.evals[layer_idx], 0.0)
+
+    def _solve_ekfac_block(
+            self,
+            evecs_A: tf.Tensor,
+            evecs_G: tf.Tensor,
+            evals: tf.Tensor,
+            v_block: tf.Tensor,
+            damping: float
+    ) -> tf.Tensor:
+        """
+        Solve the EKFAC system in the eigenbasis.
+
+        In the eigenbasis, the system is diagonal:
+        (Λ + λI) @ x_kfe = v_kfe
+
+        So: x_kfe = v_kfe / (Λ + λ)
+
+        Then transform back: x = (U_A ⊗ U_G) @ x_kfe
+
+        Parameters
+        ----------
+        evecs_A
+            Eigenvectors of A factor.
+        evecs_G
+            Eigenvectors of G factor.
+        evals
+            2D eigenvalue matrix (out_dim, in_dim).
+        v_block
+            Vector block for this layer (flattened).
+        damping
+            Regularization parameter.
+
+        Returns
+        -------
+        x_block
+            Solution vector (flattened).
+        """
+        in_dim = evecs_A.shape[0]
+        out_dim = evecs_G.shape[0]
+
+        # Reshape v to matrix form
+        V = tf.reshape(v_block, (in_dim, out_dim))
+
+        # Project to eigenbasis: V_kfe = U_A^T @ V @ U_G
+        V_kfe = tf.matmul(tf.matmul(evecs_A, V, transpose_a=True), evecs_G)
+
+        # Solve in eigenbasis (element-wise division)
+        # Note: evals is (out_dim, in_dim), V_kfe is (in_dim, out_dim)
+        evals_T = tf.transpose(evals)  # (in_dim, out_dim)
+        X_kfe = V_kfe / (evals_T + damping)
+
+        # Handle numerical issues
+        X_kfe = tf.where(tf.math.is_finite(X_kfe), X_kfe, tf.zeros_like(X_kfe))
+
+        # Project back: X = U_A @ X_kfe @ U_G^T
+        X = tf.matmul(tf.matmul(evecs_A, X_kfe), evecs_G, transpose_b=True)
+
+        return tf.reshape(X, [-1])
+
+    def _compute_ihvp_single_batch(self, group_batch: Tuple[tf.Tensor, ...], use_gradient: bool = True) -> tf.Tensor:
+        """
+        Computes the inverse-EKFAC-vector product for a batch of points.
+
+        Parameters
+        ----------
+        group_batch
+            A tuple containing the batch of inputs and labels.
+        use_gradient
+            If True, compute gradients of the loss; if False, use the input directly as vectors.
+
+        Returns
+        -------
+        ihvp
+            The inverse-EKFAC-vector product, shape (nb_params, batch_size).
+        """
+        if use_gradient:
+            grads = self.model.batch_jacobian_tensor(group_batch)
+            grads = tf.reshape(grads, (-1, self.model.nb_params))
+        else:
+            grads = tf.reshape(group_batch[0], (-1, self.model.nb_params))
+
+        grads = tf.cast(grads, dtype=tf.float32)
+        grads = tf.where(tf.math.is_finite(grads), grads, tf.zeros_like(grads))
+
+        batch_size = tf.shape(grads)[0]
+        ihvp_list = []
+
+        for i in range(batch_size):
+            grad = grads[i]
+            ihvp_sample = []
+
+            param_idx = 0
+            for layer_idx, info in enumerate(self.layer_info):
+                n_params = info['n_params']
+                v_block = grad[param_idx:param_idx + n_params]
+
+                evecs_A, evecs_G = self.evecs[layer_idx]
+                evals = self.evals[layer_idx]
+
+                x_block = self._solve_ekfac_block(evecs_A, evecs_G, evals, v_block, self.damping)
+
+                ihvp_sample.append(x_block)
+                param_idx += n_params
+
+            ihvp_list.append(tf.concat(ihvp_sample, axis=0))
+
+        ihvp = tf.stack(ihvp_list, axis=0)
+        ihvp = tf.where(tf.math.is_finite(ihvp), ihvp, tf.zeros_like(ihvp))
+
+        return tf.transpose(ihvp)
+
+
+
 class IHVPCalculator(Enum):
     """
     Inverse Hessian Vector Product Calculator interface.
@@ -754,6 +1785,9 @@ class IHVPCalculator(Enum):
     Exact = ExactIHVP
     Cgd = ConjugateGradientDescentIHVP
     Lissa = LissaIHVP
+    Fisher = FisherIHVP
+    KFAC = KFACIHVP
+    EKFAC = EKFACIHVP
 
     @staticmethod
     def from_string(ihvp_calculator: str) -> 'IHVPCalculator':
@@ -764,18 +1798,26 @@ class IHVPCalculator(Enum):
         ----------
         ihvp_calculator
             String indicated the method use to compute the inverse hessian vector product,
-            e.g 'exact' or 'cgd'.
+            e.g 'exact', 'cgd', 'lissa', 'fisher', 'kfac', or 'ekfac'.
 
         Returns
         -------
         ivhp_calculator
             IHVPCalculator object.
         """
-        assert ihvp_calculator in ['exact', 'cgd', 'lissa'], "Only 'exact', 'lissa' and 'cgd' inverse hessian " \
-                                                             "vector product calculators are supported."
+        valid_calculators = ['exact', 'cgd', 'lissa', 'fisher', 'kfac', 'ekfac']
+        assert ihvp_calculator in valid_calculators, \
+            f"Only {valid_calculators} inverse hessian vector product calculators are supported."
+
         if ihvp_calculator == 'exact':
             return IHVPCalculator.Exact
         if ihvp_calculator == 'lissa':
             return IHVPCalculator.Lissa
+        if ihvp_calculator == 'fisher':
+            return IHVPCalculator.Fisher
+        if ihvp_calculator == 'kfac':
+            return IHVPCalculator.KFAC
+        if ihvp_calculator == 'ekfac':
+            return IHVPCalculator.EKFAC
 
         return IHVPCalculator.Cgd

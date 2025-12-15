@@ -10,7 +10,10 @@ from dataclasses import dataclass
 
 import tensorflow as tf
 from tensorflow.keras import Model # pylint: disable=E0611
-from tensorflow.keras.optimizers import Optimizer, SGD # pylint: disable=E0611
+try:
+    from tensorflow.keras.optimizers import Optimizer, SGD  # pylint: disable=E0611
+except ImportError:
+    from tensorflow.keras.optimizers.legacy import Optimizer, SGD  # TF 2.11+
 
 from ..types import Callable
 

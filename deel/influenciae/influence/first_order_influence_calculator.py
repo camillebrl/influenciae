@@ -88,7 +88,6 @@ class FirstOrderInfluenceCalculator(BaseInfluenceCalculator, BaseGroupInfluenceC
 
         self.normalize = normalize
 
-    @tf.function
     def _normalize_if_needed(self, v):
         """
         Normalize the input vector if the normalize property is True. If False, do nothing
@@ -104,10 +103,12 @@ class FirstOrderInfluenceCalculator(BaseInfluenceCalculator, BaseGroupInfluenceC
             The normalized vector if the normalize property is True, otherwise the input vector
         """
         if self.normalize:
-            v = v / tf.norm(v, axis=0, keepdims=True)
+            norm = tf.norm(v, axis=0, keepdims=True)
+            # Avoid division by zero
+            norm = tf.where(norm > 1e-10, norm, tf.ones_like(norm))
+            v = v / norm
         return v
 
-    @tf.function
     def _compute_influence_vector(self, train_samples: Tuple[tf.Tensor, ...]) -> tf.Tensor:
         """
         Computes the influence vector (i.e. the delta of model's weights after a perturbation on the training
@@ -128,7 +129,6 @@ class FirstOrderInfluenceCalculator(BaseInfluenceCalculator, BaseGroupInfluenceC
         influence_vector = tf.transpose(influence_vector)
         return influence_vector
 
-    @tf.function
     def _preprocess_samples(self, samples: Tuple[tf.Tensor, ...]) -> tf.Tensor:
         """
         Preprocess a sample to evaluate
@@ -171,7 +171,6 @@ class FirstOrderInfluenceCalculator(BaseInfluenceCalculator, BaseGroupInfluenceC
             self._compute_influence_vector(train_samples)
         )
 
-    @tf.function
     def _estimate_influence_value_from_influence_vector(self, preproc_test_sample: tf.Tensor,
                                                         influence_vector: tf.Tensor) -> tf.Tensor:
         """
@@ -193,7 +192,6 @@ class FirstOrderInfluenceCalculator(BaseInfluenceCalculator, BaseGroupInfluenceC
         influence_values = tf.matmul(preproc_test_sample, tf.transpose(influence_vector))
         return influence_values
 
-    @tf.function
     def _compute_influence_value_from_batch(self, train_samples: Tuple[tf.Tensor, ...]) -> tf.Tensor:
         """
         Computes the influence score (self-influence) for a single batch of training samples.

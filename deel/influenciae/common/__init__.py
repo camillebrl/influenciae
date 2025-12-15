@@ -9,5 +9,5 @@ Common classes and methods
 from .model_wrappers import BaseInfluenceModel, InfluenceModel
 from .base_influence import SelfInfluenceCalculator, BaseInfluenceCalculator, CACHE
 from .inverse_hessian_vector_product import InverseHessianVectorProduct, ExactIHVP, ConjugateGradientDescentIHVP, \
-     IHVPCalculator, LissaIHVP, ForwardOverBackwardHVP
+     IHVPCalculator, LissaIHVP, ForwardOverBackwardHVP, FisherIHVP, EKFACIHVP, KFACIHVP
 from .ihvp_factory import InverseHessianVectorProductFactory, ExactIHVPFactory, CGDIHVPFactory, LissaIHVPFactory

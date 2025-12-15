@@ -63,3 +63,9 @@ lab/
 # ide
 .idea
 .vscode
+
+# models
+models
+
+# old
+**/old/

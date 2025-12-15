@@ -15,7 +15,10 @@ import json
 
 import tensorflow as tf
 import numpy as np
-from tensorflow.keras.optimizers import Optimizer # pylint: disable=E0611
+try:
+    from tensorflow.keras.optimizers import Optimizer  # pylint: disable=E0611
+except ImportError:
+    from tensorflow.keras.optimizers.legacy import Optimizer  # TF 2.11+
 
 from .influence_factory import InfluenceCalculatorFactory
 from ..types import Tuple, Dict, Any, Optional, List
@@ -392,7 +395,7 @@ class MislabelingDetectorEvaluator:
             A tuple with the noisy dataset and a numpy array with the flipped labels (used for validation
             during the evaluation).
         """
-        dataset_size = tf.data.experimental.cardinality(self.training_dataset)
+        dataset_size = self.training_dataset.cardinality()
         noise_mask = np.random.uniform(size=(dataset_size,)) > self.mislabeling_ratio
         noise_mask_dataset = tf.data.Dataset.from_tensor_slices(noise_mask)
         noisy_dataset = tf.data.Dataset.zip((self.training_dataset, noise_mask_dataset))
@@ -488,7 +491,7 @@ class ModelsSaver(tf.keras.callbacks.Callback):
             self.learning_rates.append(epoch_lr.numpy())
 
             if self.saving_path is not None:
-                tf.data.experimental.save(f"{self.saving_path}/model_ep_{epoch:.6d}")
+                epoch_model.save(f"{self.saving_path}/model_ep_{epoch:.6d}")
                 np.save(f"{self.saving_path}/learning_rates", np.array(self.learning_rates), allow_pickle=True)
                 with open(f"{self.saving_path}/logs.json", "w", encoding='utf8') as f:
                     json.dump(logs, f)

@@ -96,7 +96,6 @@ class RepresenterPointL2(BaseRepresenterPoint):
 
         self.linear_layer.compile(optimizer=optimizer, loss=loss_function)
 
-    @tf.function
     def _learn_step_last_layer(
             self,
             x_batch: tf.Tensor,
@@ -164,8 +163,8 @@ class RepresenterPointL2(BaseRepresenterPoint):
         alpha
             mean of the gradient
         """
-        with tf.GradientTape(persistent=False, watch_accessed_variables=False) as tape:
-            tape.watch(self.linear_layer.weights)
+        # Use watch_accessed_variables=True for Keras 3.x compatibility
+        with tf.GradientTape(persistent=False) as tape:
             logits = self.linear_layer(z_batch)
             loss = self.linear_layer.compiled_loss(y_batch, logits)
         alpha = tape.jacobian(loss, self.linear_layer.weights)[0]

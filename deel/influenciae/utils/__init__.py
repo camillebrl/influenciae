@@ -21,3 +21,9 @@ from .tf_operations import (
 )
 from .sorted_dict import BatchSort, ORDER
 from .nearest_neighbors import BaseNearestNeighbors, LinearNearestNeighbors
+from .pytorch_to_tensorflow import (
+    convert_linear_weights,
+    mlp_pytorch_to_tensorflow,
+    simple_mlp_pytorch_to_tensorflow,
+    verify_conversion,
+)

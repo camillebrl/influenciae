@@ -20,7 +20,10 @@ from tensorflow.keras.applications import EfficientNetB0, VGG19 # pylint: disabl
 from tensorflow.keras.layers import Dense, Flatten, Dropout # pylint: disable=E0611
 from tensorflow.keras.regularizers import L1L2 # pylint: disable=E0611
 from tensorflow.keras.losses import CategoricalCrossentropy # pylint: disable=E0611
-from tensorflow.keras.optimizers import Adam # pylint: disable=E0611
+try:
+    from tensorflow.keras.optimizers import Adam  # pylint: disable=E0611
+except ImportError:
+    from tensorflow.keras.optimizers.legacy import Adam  # TF 2.11+
 
 from .base_benchmark import BaseTrainingProcedure, MislabelingDetectorEvaluator, ModelsSaver
 from .model_resnet import ResNet
@@ -191,7 +194,10 @@ class Cifar10TrainingProcedure(BaseTrainingProcedure):
 
             lr_scheduler = LearningRateSchedulerMaxMin(0.1, 0.0001, epochs=200)
             callbacks = [lr_scheduler]
-            optimizer = tf.keras.optimizers.SGD(0.1, momentum=0.9)
+            try:
+                optimizer = tf.keras.optimizers.SGD(0.1, momentum=0.9)
+            except TypeError:
+                optimizer = tf.keras.optimizers.legacy.SGD(0.1, momentum=0.9)
         else:
             def lr_schedule(epoch: int):
                 lr = self.learning_rate
