@@ -20,6 +20,7 @@ from .model_wrappers import BaseInfluenceModel, InfluenceModel
 from ..types import Optional, Union, Tuple, List, Callable, Dict
 from ..utils import assert_batched_dataset, conjugate_gradients_solve, map_to_device
 
+from typing import Dict, List, Optional, Tuple
 
 class InverseHessianVectorProduct(ABC):
     """
@@ -215,8 +216,9 @@ class ExactIHVP(InverseHessianVectorProduct):
             nb_batch_saw += tf.constant(1, dtype=tf.int32)
             curr_nb_elt = tf.shape(batch[0])[0]
             nb_elt += curr_nb_elt
-            with tf.GradientTape(persistent=True, watch_accessed_variables=False) as tape_hess:
-                tape_hess.watch(weights)
+            # Use watch_accessed_variables=True (default) for Keras 3.x compatibility
+            # This automatically tracks all variables accessed in the tape context
+            with tf.GradientTape(persistent=True) as tape_hess:
                 grads = self.model.batch_jacobian_tensor(batch) # pylint: disable=W0212
 
             curr_hess = tape_hess.jacobian(
@@ -908,7 +910,7 @@ class FisherIHVP(InverseHessianVectorProduct):
         """
         Compute the inverse of the Fisher matrix with Tikhonov regularization.
 
-        Uses LDL decomposition for numerical stability (similar to nngeometry).
+        Uses LDL decomposition for numerical stability.
 
         Parameters
         ----------
@@ -1047,7 +1049,337 @@ class FisherIHVP(InverseHessianVectorProduct):
 
         return hvp
 
+
+
 class KFACIHVP(InverseHessianVectorProduct):
+    """
+    Inverse Hessian-Vector Product calculator using K-FAC with pi-damping.
+
+    Per-layer curvature (Fisher / Gauss-Newton) block approximation:
+        F_i ≈ G_i ⊗ A_i
+
+    Dense layer: h = W a + b
+      - a: input activation of the layer (optionally augmented with 1 for bias absorption)
+      - g: pre-activation gradient g = ∂ℓ/∂h (for Dense with bias: g = ∂ℓ/∂b)
+
+    Factors:
+      - A_i = E[a a^T] ∈ R^{(din+1)×(din+1)} if bias is absorbed, else R^{din×din}
+      - G_i = E[g g^T] ∈ R^{dout×dout}
+
+    (π-)damping:
+      pi = sqrt( tr(A)/tr(G) * dim(G)/dim(A) )
+      A_reg = A + sqrt(regul) * pi * I
+      G_reg = G + sqrt(regul) / pi * I
+
+    Solve approximation:
+      (G ⊗ A + regul I)^{-1} v  ≈ vec( A_reg^{-1} V G_reg^{-1} )
+      implemented via two linear solves.
+
+    IMPORTANT CONVENTION (bias):
+      For a Dense layer with bias, we represent parameters and vectors as an augmented matrix:
+        W' = [W; b^T]  with shape (din+1, dout)
+      and v_block = vec(W') (flattened from shape (din+1, dout)).
+    """
+
+    def __init__(
+        self,
+        model: "InfluenceModel",
+        train_dataset: Optional[tf.data.Dataset] = None,
+        regul: float = 1e-3,      # use "regul" (λ); note sqrt(regul) is used in factors
+        use_pi: bool = True,
+    ):
+        super().__init__(model, train_dataset)
+        if train_dataset is None:
+            raise ArgumentError("train_dataset must be provided for KFAC")
+
+        self.regul = float(regul)
+        self.use_pi = bool(use_pi)
+
+        # Dense layer metadata
+        self.layer_info = self._extract_layer_info()
+
+        # Compute KFAC factors
+        self.kfac_blocks = self._compute_kfac_blocks(train_dataset)
+
+    # ---------------------------------------------------------------------
+    # Layer metadata
+    # ---------------------------------------------------------------------
+    def _extract_layer_info(self) -> List[dict]:
+        layer_info: List[dict] = []
+        weight_idx = 0
+
+        for layer in self.model.model.layers:
+            if isinstance(layer, tf.keras.layers.Dense):
+                weights = layer.get_weights()
+                if len(weights) >= 1:
+                    kernel = weights[0]  # (in, out)
+                    has_bias = len(weights) > 1
+
+                    in_features = int(kernel.shape[0])
+                    out_features = int(kernel.shape[1])
+
+                    # We will assume *augmented* layout if bias: (in+1)*out params in the block
+                    n_params = in_features * out_features + (out_features if has_bias else 0)
+
+                    layer_info.append(
+                        {
+                            "layer": layer,
+                            "in_features": in_features,
+                            "out_features": out_features,
+                            "has_bias": has_bias,
+                            "weight_start_idx": weight_idx,
+                            "n_params": n_params,
+                        }
+                    )
+                    weight_idx += n_params
+
+        return layer_info
+
+    # ---------------------------------------------------------------------
+    # Compute KFAC factors
+    # ---------------------------------------------------------------------
+    def _compute_kfac_blocks(self, dataset: tf.data.Dataset) -> Dict[int, Tuple[tf.Tensor, tf.Tensor]]:
+        """
+        Compute per-layer KFAC factors A and G:
+          A = (1/N) Σ a a^T   where a is layer input activation (augmented with 1 if bias)
+          G = (1/N) Σ g g^T   where g = ∂ℓ/∂h (use bias-gradient when available)
+        """
+        A_accum: Dict[int, tf.Tensor] = {}
+        G_accum: Dict[int, tf.Tensor] = {}
+        n_samples = 0
+
+        for layer_idx, info in enumerate(self.layer_info):
+            in_dim = info["in_features"] + (1 if info["has_bias"] else 0)
+            out_dim = info["out_features"]
+            A_accum[layer_idx] = tf.zeros((in_dim, in_dim), dtype=tf.float32)
+            G_accum[layer_idx] = tf.zeros((out_dim, out_dim), dtype=tf.float32)
+
+        # NOTE: this implementation is conceptually correct but can be slow:
+        # it loops over samples and builds per-layer submodels repeatedly.
+        # Keep for correctness; optimize later if needed.
+        for batch in dataset:
+            inputs, labels, sample_weight = self.model.process_batch_for_loss_fn(batch)
+            batch_size = int(tf.shape(inputs)[0].numpy())
+            n_samples += batch_size
+
+            for sample_idx in range(batch_size):
+                x = inputs[sample_idx : sample_idx + 1]
+                y = labels[sample_idx : sample_idx + 1]
+                w = sample_weight[sample_idx : sample_idx + 1] if sample_weight is not None else None
+
+                with tf.GradientTape(persistent=True) as tape:
+                    y_pred = self.model.model(x, training=True)
+                    if w is not None:
+                        loss = self.model.loss_function(y, y_pred, w)
+                    else:
+                        loss = self.model.loss_function(y, y_pred)
+                    loss = tf.reduce_sum(loss)
+
+                for layer_idx, info in enumerate(self.layer_info):
+                    layer = info["layer"]
+                    kernel = layer.kernel
+                    bias = layer.bias if info["has_bias"] else None
+
+                    grad_kernel = tape.gradient(loss, kernel)
+                    if grad_kernel is None:
+                        continue
+
+                    # Get layer input activation a (shape: (1, in_features))
+                    layer_input_model = tf.keras.Model(inputs=self.model.model.input, outputs=layer.input)
+                    a = layer_input_model(x, training=True)          # (1, in)
+                    a = tf.squeeze(a, axis=0)                        # (in,)
+
+                    # Get g = ∂ℓ/∂h. For Dense with bias: grad_bias == g (shape: (out,))
+                    if bias is not None:
+                        grad_bias = tape.gradient(loss, bias)
+                        if grad_bias is not None:
+                            g = grad_bias
+                        else:
+                            # fallback estimate (less stable)
+                            a_norm_sq = tf.reduce_sum(a * a) + 1e-8
+                            g = tf.linalg.matvec(grad_kernel, a, transpose_a=True) / a_norm_sq
+                    else:
+                        a_norm_sq = tf.reduce_sum(a * a) + 1e-8
+                        g = tf.linalg.matvec(grad_kernel, a, transpose_a=True) / a_norm_sq
+
+                    # bias absorption: augment a with 1
+                    if info["has_bias"]:
+                        a = tf.concat([a, [1.0]], axis=0)  # (in+1,)
+
+                    a_col = tf.reshape(tf.cast(a, tf.float32), (-1, 1))  # (in_dim, 1)
+                    g_col = tf.reshape(tf.cast(g, tf.float32), (-1, 1))  # (out_dim, 1)
+
+                    A_accum[layer_idx] += tf.matmul(a_col, a_col, transpose_b=True)
+                    G_accum[layer_idx] += tf.matmul(g_col, g_col, transpose_b=True)
+
+                del tape
+
+        n_samples_f = tf.cast(n_samples, tf.float32)
+        kfac_blocks: Dict[int, Tuple[tf.Tensor, tf.Tensor]] = {}
+
+        for layer_idx in range(len(self.layer_info)):
+            A = A_accum[layer_idx] / n_samples_f
+            G = G_accum[layer_idx] / n_samples_f
+
+            # symmetrize & sanitize
+            A = (A + tf.transpose(A)) / 2.0
+            G = (G + tf.transpose(G)) / 2.0
+            A = tf.where(tf.math.is_finite(A), A, tf.zeros_like(A))
+            G = tf.where(tf.math.is_finite(G), G, tf.zeros_like(G))
+
+            kfac_blocks[layer_idx] = (A, G)
+
+        return kfac_blocks
+    
+    def _compute_pi(self, A: tf.Tensor, G: tf.Tensor) -> tf.Tensor:
+        if not self.use_pi:
+            return tf.constant(1.0, dtype=tf.float32)
+
+        trA = tf.linalg.trace(A)
+        trG = tf.linalg.trace(G)
+        trA = tf.maximum(trA, 1e-12)
+        trG = tf.maximum(trG, 1e-12)
+
+        dimA = tf.cast(tf.shape(A)[0], tf.float32)
+        dimG = tf.cast(tf.shape(G)[0], tf.float32)
+
+        return tf.sqrt((trA / trG) * (dimG / dimA))
+
+    def _damp_factors(self, A: tf.Tensor, G: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+        """
+          A_reg = A + sqrt(regul) * pi * I
+          G_reg = G + sqrt(regul) / pi * I
+        """
+        pi = self._compute_pi(A, G)
+        sqrt_reg = tf.sqrt(tf.cast(self.regul, tf.float32))
+
+        in_dim = tf.shape(A)[0]
+        out_dim = tf.shape(G)[0]
+
+        A_reg = A + sqrt_reg * pi * tf.eye(in_dim, dtype=A.dtype)
+        G_reg = G + sqrt_reg / pi * tf.eye(out_dim, dtype=G.dtype)
+        return A_reg, G_reg
+
+    def _unpack_block_as_aug_matrix(self, v_block: tf.Tensor, info: dict) -> tf.Tensor:
+        """
+        Convert v_block into V_aug of shape (in_dim, out_dim), where in_dim=din(+1 if bias).
+        This assumes v_block is stored as vec(W_aug) with W_aug stacked as (in_dim, out_dim).
+        """
+        in_dim = info["in_features"] + (1 if info["has_bias"] else 0)
+        out_dim = info["out_features"]
+        return tf.reshape(v_block, (in_dim, out_dim))  # (in_dim, out)
+
+    def _pack_aug_matrix_as_block(self, V: tf.Tensor) -> tf.Tensor:
+        return tf.reshape(V, [-1])
+
+    def _solve_block(self, A: tf.Tensor, G: tf.Tensor, v_block: tf.Tensor, info: dict) -> tf.Tensor:
+        """
+        Approximate (G ⊗ A + regul I)^{-1} v using two-solve recipe
+        with pi-damped factors.
+        """
+        A_reg, G_reg = self._damp_factors(A, G)
+
+        V = self._unpack_block_as_aug_matrix(v_block, info)  # (in_dim, out)
+
+        # use (out, in) internally: solve G_reg * X = V^T
+        V_t = tf.transpose(V)  # (out, in)
+
+        # Solve: G_reg X = V^T  => X = G_reg^{-1} V^T
+        X = tf.linalg.lstsq(G_reg, V_t, fast=True)  # (out, in)
+
+        # Solve: A_reg Y = X^T => Y = A_reg^{-1} X^T
+        Y = tf.linalg.lstsq(A_reg, tf.transpose(X), fast=True)  # (in, out)
+
+        return self._pack_aug_matrix_as_block(Y)  # vec(in_dim, out)
+
+    def _apply_block_kfac(self, A: tf.Tensor, G: tf.Tensor, v_block: tf.Tensor, info: dict) -> tf.Tensor:
+        """
+        Apply (G ⊗ A) v using (G ⊗ A) vec(V) = vec(A V G^T).
+        (No damping here; if you want damped HVP, apply _damp_factors first.)
+        """
+        V = self._unpack_block_as_aug_matrix(v_block, info)  # (in_dim, out)
+        result = tf.matmul(A, tf.matmul(V, G, transpose_b=True))  # (in_dim, out)
+        return self._pack_aug_matrix_as_block(result)
+
+    # ---------------------------------------------------------------------
+    # Public-ish API expected by your base class
+    # ---------------------------------------------------------------------
+    def _compute_ihvp_single_batch(self, group_batch: Tuple[tf.Tensor, ...], use_gradient: bool = True) -> tf.Tensor:
+        """
+        Returns IHVP of shape (nb_params, batch_size) (transposed stack convention kept from your code).
+        """
+        if use_gradient:
+            grads = self.model.batch_jacobian_tensor(group_batch)
+            grads = tf.reshape(grads, (-1, self.model.nb_params))
+        else:
+            grads = tf.reshape(group_batch[0], (-1, self.model.nb_params))
+
+        grads = tf.cast(grads, tf.float32)
+        grads = tf.where(tf.math.is_finite(grads), grads, tf.zeros_like(grads))
+
+        batch_size = tf.shape(grads)[0]
+        ihvp_list = []
+
+        for i in range(batch_size):
+            grad = grads[i]
+            blocks = []
+            param_idx = 0
+
+            for layer_idx, info in enumerate(self.layer_info):
+                n_params = info["n_params"]
+                v_block = grad[param_idx : param_idx + n_params]
+
+                A, G = self.kfac_blocks[layer_idx]
+                x_block = self._solve_block(A, G, v_block, info)
+
+                blocks.append(x_block)
+                param_idx += n_params
+
+            ihvp_list.append(tf.concat(blocks, axis=0))
+
+        ihvp = tf.stack(ihvp_list, axis=0)               # (batch, nb_params)
+        ihvp = tf.where(tf.math.is_finite(ihvp), ihvp, tf.zeros_like(ihvp))
+        return tf.transpose(ihvp)                        # (nb_params, batch)
+
+    def _compute_hvp_single_batch(self, group_batch: Tuple[tf.Tensor, ...], use_gradient: bool = True) -> tf.Tensor:
+        """
+        Returns HVP of shape (nb_params, batch_size), using KFAC blocks (no damping by default).
+        """
+        if use_gradient:
+            grads = self.model.batch_jacobian_tensor(group_batch)
+            grads = tf.reshape(grads, (-1, self.model.nb_params))
+        else:
+            grads = tf.reshape(group_batch[0], (-1, self.model.nb_params))
+
+        grads = tf.cast(grads, tf.float32)
+        grads = tf.where(tf.math.is_finite(grads), grads, tf.zeros_like(grads))
+
+        batch_size = tf.shape(grads)[0]
+        hvp_list = []
+
+        for i in range(batch_size):
+            grad = grads[i]
+            blocks = []
+            param_idx = 0
+
+            for layer_idx, info in enumerate(self.layer_info):
+                n_params = info["n_params"]
+                v_block = grad[param_idx : param_idx + n_params]
+
+                A, G = self.kfac_blocks[layer_idx]
+                x_block = self._apply_block_kfac(A, G, v_block, info)
+
+                blocks.append(x_block)
+                param_idx += n_params
+
+            hvp_list.append(tf.concat(blocks, axis=0))
+
+        hvp = tf.stack(hvp_list, axis=0)                 # (batch, nb_params)
+        hvp = tf.where(tf.math.is_finite(hvp), hvp, tf.zeros_like(hvp))
+        return tf.transpose(hvp)                         # (nb_params, batch)
+
+
+class OldKFACIHVP(InverseHessianVectorProduct):
     """
     Inverse Hessian-Vector Product calculator using Kronecker-Factored Approximate Curvature (KFAC).
 
@@ -1108,6 +1440,8 @@ class KFACIHVP(InverseHessianVectorProduct):
 
         if train_dataset is not None:
             self.kfac_blocks = self._compute_kfac_blocks(train_dataset)
+            # Pre-compute eigendecomposition for memory-efficient solves
+            self.kfac_eigen = self._compute_kfac_eigendecomp()
         else:
             raise ArgumentError("train_dataset must be provided for KFAC")
 
@@ -1179,69 +1513,79 @@ class KFACIHVP(InverseHessianVectorProduct):
             A_accum[layer_idx] = tf.zeros((in_dim, in_dim), dtype=tf.float32)
             G_accum[layer_idx] = tf.zeros((out_dim, out_dim), dtype=tf.float32)
 
-        # Build intermediate models to get activations
-        layer_inputs = []
-        layer_outputs = []
-
-        for info in self.layer_info:
-            layer = info['layer']
-            # Get the input to this layer
-            layer_input_model = tf.keras.Model(
-                inputs=self.model.model.input,
-                outputs=layer.input
-            )
-            layer_inputs.append(layer_input_model)
-
-        # Process dataset
+        # Process dataset - use gradient w.r.t. kernel to compute KFAC factors
         for batch in dataset:
             inputs, labels, sample_weight = self.model.process_batch_for_loss_fn(batch)
-            batch_size = tf.shape(inputs)[0]
+            batch_size_tensor = tf.shape(inputs)[0]
+            batch_size = batch_size_tensor.numpy()
             n_samples += batch_size
 
-            # Forward pass with gradient tape to get per-layer gradients
-            with tf.GradientTape(persistent=True) as tape:
-                # Get activations at each layer input
-                activations = [model(inputs) for model in layer_inputs]
+            # For each sample, compute individual gradients to get activation/gradient pairs
+            for sample_idx in range(batch_size):
+                sample_input = inputs[sample_idx:sample_idx+1]
+                sample_label = labels[sample_idx:sample_idx+1]
+                sample_weight_s = sample_weight[sample_idx:sample_idx+1]
 
-                # Watch activations to compute gradients w.r.t. them
-                for act in activations:
-                    tape.watch(act)
+                with tf.GradientTape(persistent=True) as tape:
+                    output = self.model.model(sample_input, training=True)
+                    loss = self.model.loss_function(sample_label, output, sample_weight_s)
+                    loss = tf.reduce_sum(loss)
 
-                # Full forward pass
-                output = self.model.model(inputs)
-                loss_per_sample = self.model.loss_function(labels, output, sample_weight)
-                loss = tf.reduce_sum(loss_per_sample)
+                # Get gradients for each layer
+                for layer_idx, info in enumerate(self.layer_info):
+                    layer = info['layer']
+                    kernel = layer.kernel
+                    bias = layer.bias if info['has_bias'] else None
 
-            # Compute gradients w.r.t. each layer's output (pre-activation gradient)
-            for layer_idx, info in enumerate(self.layer_info):
-                layer = info['layer']
-                activation = activations[layer_idx]
+                    # Get gradient w.r.t. kernel: grad_kernel = a^T @ g
+                    # where a is input activation and g is output gradient
+                    grad_kernel = tape.gradient(loss, kernel)
 
-                # Compute output of this layer
-                layer_output = layer(activation)
+                    if grad_kernel is None:
+                        continue
 
-                # Gradient of loss w.r.t. layer output (this is 'g' in KFAC)
-                grad_output = tape.gradient(loss, layer_output)
+                    # grad_kernel has shape (in_features, out_features)
+                    # For a single sample: grad_kernel = a^T @ g where a is (1, in), g is (1, out)
+                    # So we can extract patterns
 
-                if grad_output is None:
-                    continue
+                    # Get input activation by running a partial forward
+                    # Use the layer's input from the model
+                    layer_input_model = tf.keras.Model(
+                        inputs=self.model.model.input,
+                        outputs=layer.input
+                    )
+                    a = layer_input_model(sample_input, training=True)  # (1, in_features)
+                    a = tf.squeeze(a, axis=0)  # (in_features,)
 
-                # A factor: input covariance
-                # Augment with 1 for bias
-                a = activation
-                if info['has_bias']:
-                    ones = tf.ones((batch_size, 1), dtype=a.dtype)
-                    a = tf.concat([a, ones], axis=1)
+                    # Compute g from: grad_kernel = outer(a, g) => g = grad_kernel^T @ a / ||a||^2
+                    # But simpler: use grad_bias if available, which equals g directly
+                    if bias is not None:
+                        grad_bias = tape.gradient(loss, bias)
+                        if grad_bias is not None:
+                            g = grad_bias  # (out_features,)
+                        else:
+                            # Fallback: estimate g from kernel gradient
+                            a_norm_sq = tf.reduce_sum(a * a) + 1e-8
+                            g = tf.linalg.matvec(grad_kernel, a, transpose_a=True) / a_norm_sq
+                    else:
+                        # No bias, estimate g
+                        a_norm_sq = tf.reduce_sum(a * a) + 1e-8
+                        g = tf.linalg.matvec(grad_kernel, a, transpose_a=True) / a_norm_sq
 
-                # Accumulate A = a^T @ a
-                A_accum[layer_idx] += tf.matmul(a, a, transpose_a=True)
+                    # Augment activation with 1 for bias
+                    if info['has_bias']:
+                        a = tf.concat([a, [1.0]], axis=0)
 
-                # G factor: output gradient covariance
-                g = grad_output
-                # Accumulate G = g^T @ g
-                G_accum[layer_idx] += tf.matmul(g, g, transpose_a=True)
+                    # Accumulate A = a @ a^T (outer product)
+                    a = tf.reshape(a, (-1, 1))
+                    A_accum[layer_idx] += tf.matmul(a, a, transpose_b=True)
 
-            del tape
+                    # Accumulate G = g @ g^T (outer product)
+                    g = tf.reshape(g, (-1, 1))
+                    G_accum[layer_idx] += tf.matmul(g, g, transpose_b=True)
+
+                # Free the persistent tape
+                del tape
 
         # Average and create blocks
         kfac_blocks = {}
@@ -1261,94 +1605,111 @@ class KFACIHVP(InverseHessianVectorProduct):
 
         return kfac_blocks
 
-    def _compute_pi_correction(self, A: tf.Tensor, G: tf.Tensor) -> float:
+    def _compute_kfac_eigendecomp(self) -> dict:
         """
-        Compute pi correction factor for balanced damping.
+        Pre-compute eigendecomposition of KFAC blocks for efficient solves.
 
-        pi = sqrt((trace(A) * dim(G)) / (trace(G) * dim(A)))
-
-        This balances the regularization between the two factors.
-
-        Parameters
-        ----------
-        A
-            Input covariance factor.
-        G
-            Output gradient covariance factor.
+        Following kronfluence approach:
+        1. Eigendecompose A and G
+        2. Compute lambda = kron(eig_A, eig_G) as 2D matrix
+        3. Pre-compute inverse: 1/(lambda + damping)
 
         Returns
         -------
-        pi
-            The correction factor.
+        kfac_eigen
+            Dictionary mapping layer_idx to (Q_A, Q_G, lambda_inv) tuples.
         """
-        trace_A = tf.linalg.trace(A)
-        trace_G = tf.linalg.trace(G)
-        dim_A = tf.cast(tf.shape(A)[0], tf.float32)
-        dim_G = tf.cast(tf.shape(G)[0], tf.float32)
+        kfac_eigen = {}
 
-        # Avoid division by zero
-        trace_G = tf.maximum(trace_G, 1e-10)
-        dim_A = tf.maximum(dim_A, 1.0)
+        for layer_idx, (A, G) in self.kfac_blocks.items():
+            # Eigendecomposition of A (symmetric matrix) - activation covariance
+            eigenvalues_A, eigenvectors_A = tf.linalg.eigh(A)
+            # Eigendecomposition of G (symmetric matrix) - gradient covariance
+            eigenvalues_G, eigenvectors_G = tf.linalg.eigh(G)
 
-        pi = tf.sqrt((trace_A * dim_G) / (trace_G * dim_A))
-        pi = tf.clip_by_value(pi, 1e-5, 1e5)  # Prevent extreme values
+            # Clamp eigenvalues to be positive (numerical stability)
+            eigenvalues_A = tf.maximum(eigenvalues_A, 1e-10)
+            eigenvalues_G = tf.maximum(eigenvalues_G, 1e-10)
 
-        return float(pi.numpy())
+            # Compute lambda matrix as outer product of eigenvalues
+            # lambda[i,j] = eigenvalues_G[i] * eigenvalues_A[j]
+            # This is equivalent to diag of kron(A, G) in the eigenbasis
+            lambda_matrix = tf.einsum('i,j->ij', eigenvalues_G, eigenvalues_A)
+
+            # Add damping and compute inverse (following kronfluence)
+            lambda_matrix = lambda_matrix + self.damping
+            lambda_inv = 1.0 / lambda_matrix
+
+            kfac_eigen[layer_idx] = (
+                eigenvectors_A,  # Q_A: (in_dim, in_dim)
+                eigenvectors_G,  # Q_G: (out_dim, out_dim)
+                lambda_inv,      # (out_dim, in_dim)
+            )
+
+        return kfac_eigen
 
     def _solve_kfac_block(
             self,
             A: tf.Tensor,
             G: tf.Tensor,
             v_block: tf.Tensor,
-            damping: float
+            damping: float,
+            layer_idx: int = None
     ) -> tf.Tensor:
         """
         Solve (G ⊗ A + λI) @ x = v for x using the Kronecker structure.
 
-        Using the property: (G ⊗ A)^{-1} = G^{-1} ⊗ A^{-1}
-        We solve: x = (A + sqrt(λ/pi) I)^{-1} @ V @ (G + sqrt(λ*pi) I)^{-T}
-
-        where V is v_block reshaped to (in_features, out_features).
+        Following kronfluence approach:
+        1. Transform gradient to eigenbasis: G_eig = Q_G.T @ G @ Q_A
+        2. Multiply by pre-computed inverse eigenvalues: G_eig *= lambda_inv
+        3. Transform back: G = Q_G @ G_eig @ Q_A.T
 
         Parameters
         ----------
         A
-            Input covariance factor.
+            Input covariance factor (unused if layer_idx provided).
         G
-            Output gradient covariance factor.
+            Output gradient covariance factor (unused if layer_idx provided).
         v_block
             Vector block for this layer (flattened).
         damping
-            Regularization parameter.
+            Regularization parameter (unused, damping is pre-computed in eigendecomp).
+        layer_idx
+            Layer index to use cached eigendecomposition.
 
         Returns
         -------
         x_block
             Solution vector (flattened).
         """
-        in_dim = A.shape[0]
-        out_dim = G.shape[0]
+        # Use cached eigendecomposition (kronfluence approach)
+        if layer_idx is not None and hasattr(self, 'kfac_eigen') and layer_idx in self.kfac_eigen:
+            Q_A, Q_G, lambda_inv = self.kfac_eigen[layer_idx]
 
-        # Compute pi correction
-        pi = self._compute_pi_correction(A, G)
+            in_dim = Q_A.shape[0]
+            out_dim = Q_G.shape[0]
 
-        # Add damping with pi correction
-        sqrt_damping = tf.sqrt(damping)
-        A_reg = A + (sqrt_damping / pi) * tf.eye(in_dim, dtype=A.dtype)
-        G_reg = G + (sqrt_damping * pi) * tf.eye(out_dim, dtype=G.dtype)
+            # Reshape v to matrix form
+            # TF Dense kernel is (in_features, out_features), but kronfluence gradient is (out_dim, in_dim)
+            V = tf.reshape(v_block, (in_dim, out_dim))
+            V = tf.transpose(V)  # Now (out_dim, in_dim)
 
-        # Reshape v to matrix form (in_features, out_features)
-        V = tf.reshape(v_block, (in_dim, out_dim))
+            # Following kronfluence precondition_gradient:
+            # gradient = Q_G.T @ gradient @ Q_A (transform to eigenbasis)
+            V_eigen = tf.matmul(tf.transpose(Q_G), tf.matmul(V, Q_A))
 
-        # Solve using two linear solves
-        # First solve: A_reg @ X_temp = V
-        X_temp = tf.linalg.solve(A_reg, V)
+            # gradient *= lambda_inv (element-wise multiply by pre-computed inverse)
+            V_eigen = V_eigen * lambda_inv
 
-        # Second solve: G_reg @ X^T = X_temp^T => X = (G_reg^{-1} @ X_temp^T)^T
-        X = tf.transpose(tf.linalg.solve(G_reg, tf.transpose(X_temp)))
+            # gradient = Q_G @ gradient @ Q_A.T (transform back)
+            X = tf.matmul(Q_G, tf.matmul(V_eigen, tf.transpose(Q_A)))
 
-        # Flatten back
-        return tf.reshape(X, [-1])
+            # Transpose back and flatten
+            X = tf.transpose(X)  # Back to (in_dim, out_dim)
+            return tf.reshape(X, [-1])
+
+        # Fallback: eigendecomposition not available, raise error
+        raise ValueError("KFAC eigendecomposition not computed. Cannot solve without it.")
 
     def _compute_ihvp_single_batch(self, group_batch: Tuple[tf.Tensor, ...], use_gradient: bool = True) -> tf.Tensor:
         """
@@ -1390,7 +1751,7 @@ class KFACIHVP(InverseHessianVectorProduct):
                 v_block = grad[param_idx:param_idx + n_params]
 
                 A, G = self.kfac_blocks[layer_idx]
-                x_block = self._solve_kfac_block(A, G, v_block, self.damping)
+                x_block = self._solve_kfac_block(A, G, v_block, self.damping, layer_idx=layer_idx)
 
                 ihvp_sample.append(x_block)
                 param_idx += n_params
@@ -1585,6 +1946,11 @@ class EKFACIHVP(KFACIHVP):
 
         Then: Λ[i,j] = (1/n) Σ (g_kfe[i])² × (a_kfe[j])²
 
+        The key insight is that for Dense layers:
+        - grad_kernel = outer(a, g) for each sample
+        - So we can derive g from grad_kernel and a using least squares:
+          g = a @ grad_kernel / ||a||^2
+
         Parameters
         ----------
         dataset
@@ -1599,65 +1965,83 @@ class EKFACIHVP(KFACIHVP):
 
         n_samples = 0
 
-        # Build intermediate models
-        layer_inputs = []
+        # Build intermediate models to get layer inputs
+        layer_input_models = []
         for info in self.layer_info:
             layer = info['layer']
             layer_input_model = tf.keras.Model(
                 inputs=self.model.model.input,
                 outputs=layer.input
             )
-            layer_inputs.append(layer_input_model)
+            layer_input_models.append(layer_input_model)
 
         # Process dataset
         for batch in dataset:
             inputs, labels, sample_weight = self.model.process_batch_for_loss_fn(batch)
-            batch_size = tf.shape(inputs)[0]
+            batch_size_tensor = tf.shape(inputs)[0]
+            batch_size = batch_size_tensor.numpy()
             n_samples += batch_size
 
-            with tf.GradientTape(persistent=True) as tape:
-                activations = [model(inputs) for model in layer_inputs]
-                for act in activations:
-                    tape.watch(act)
+            # Get activations for all layers (batch computation)
+            activations = [model(inputs) for model in layer_input_models]
 
-                output = self.model.model(inputs)
-                loss_per_sample = self.model.loss_function(labels, output, sample_weight)
-                loss = tf.reduce_sum(loss_per_sample)
+            # Process each sample individually to get per-sample gradients
+            for i in range(batch_size):
+                single_input = inputs[i:i+1]
+                single_label = labels[i:i+1]
+                single_weight = sample_weight[i:i+1] if sample_weight is not None else None
 
-            for layer_idx, info in enumerate(self.layer_info):
-                layer = info['layer']
-                activation = activations[layer_idx]
-                layer_output = layer(activation)
+                with tf.GradientTape() as tape:
+                    single_output = self.model.model(single_input)
+                    if single_weight is not None:
+                        single_loss = self.model.loss_function(single_label, single_output, single_weight)
+                    else:
+                        single_loss = self.model.loss_function(single_label, single_output)
+                    single_loss = tf.reduce_sum(single_loss)
 
-                grad_output = tape.gradient(loss, layer_output)
-                if grad_output is None:
-                    continue
+                # Get per-sample kernel gradients for all layers at once
+                layer_kernels = [info['layer'].kernel for info in self.layer_info]
+                grad_kernels = tape.gradient(single_loss, layer_kernels)
 
-                evecs_A, evecs_G = self.evecs[layer_idx]
+                # For each layer, derive g from grad_kernel and a
+                for layer_idx, info in enumerate(self.layer_info):
+                    grad_kernel = grad_kernels[layer_idx]
+                    if grad_kernel is None:
+                        continue
 
-                # Augment activation with bias term
-                a = activation
-                if info['has_bias']:
-                    ones = tf.ones((batch_size, 1), dtype=a.dtype)
-                    a = tf.concat([a, ones], axis=1)
+                    evecs_A, evecs_G = self.evecs[layer_idx]
 
-                g = grad_output
+                    # Get activation for this sample (from batch computation)
+                    a_sample = activations[layer_idx][i]  # (in_features,)
+                    a_sample = tf.reshape(a_sample, (-1,))
 
-                # Project to eigenbasis
-                a_kfe = tf.matmul(a, evecs_A)  # (batch, in_dim)
-                g_kfe = tf.matmul(g, evecs_G)  # (batch, out_dim)
+                    # grad_kernel shape: (in_features, out_features)
+                    # For Dense: grad_kernel = outer(a, g)
+                    # So: grad_kernel[j, k] = a[j] * g[k]
+                    # Derive g using least squares: g = a @ grad_kernel / ||a||^2
+                    a_norm_sq = tf.reduce_sum(tf.square(a_sample))
+                    a_norm_sq = tf.maximum(a_norm_sq, 1e-10)  # avoid division by zero
 
-                # Compute eigenvalue contributions: (g_kfe²) ⊗ (a_kfe²)
-                # For each sample: outer product of squared projections
-                # Sum over batch
-                a_kfe_sq = tf.square(a_kfe)  # (batch, in_dim)
-                g_kfe_sq = tf.square(g_kfe)  # (batch, out_dim)
+                    # g[k] = sum_j(a[j] * grad_kernel[j, k]) / ||a||^2
+                    g_sample = tf.linalg.matvec(grad_kernel, a_sample, transpose_a=True) / a_norm_sq  # (out_features,)
 
-                # Accumulate: Σ_batch g²[:, i] * a²[:, j] for all i,j
-                evals_contrib = tf.matmul(g_kfe_sq, a_kfe_sq, transpose_a=True)  # (out_dim, in_dim)
-                evals_accum[layer_idx] += evals_contrib
+                    # Add bias term to activation for eigenbasis projection
+                    if info['has_bias']:
+                        a_extended = tf.concat([a_sample, [1.0]], axis=0)
+                    else:
+                        a_extended = a_sample
 
-            del tape
+                    # Project to eigenbasis
+                    a_kfe = tf.linalg.matvec(evecs_A, a_extended, transpose_a=True)  # (in_dim,)
+                    g_kfe = tf.linalg.matvec(evecs_G, g_sample, transpose_a=True)  # (out_dim,)
+
+                    # Compute outer product of squared projections
+                    a_kfe_sq = tf.square(a_kfe)  # (in_dim,)
+                    g_kfe_sq = tf.square(g_kfe)  # (out_dim,)
+
+                    # Outer product: (out_dim, in_dim)
+                    contrib = tf.tensordot(g_kfe_sq, a_kfe_sq, axes=0)
+                    evals_accum[layer_idx] = evals_accum[layer_idx] + contrib
 
         # Average eigenvalues
         n_samples_float = tf.cast(n_samples, tf.float32)
@@ -1687,9 +2071,9 @@ class EKFACIHVP(KFACIHVP):
         Parameters
         ----------
         evecs_A
-            Eigenvectors of A factor.
+            Eigenvectors of A factor, shape (in_dim, in_dim).
         evecs_G
-            Eigenvectors of G factor.
+            Eigenvectors of G factor, shape (out_dim, out_dim).
         evals
             2D eigenvalue matrix (out_dim, in_dim).
         v_block
@@ -1705,14 +2089,16 @@ class EKFACIHVP(KFACIHVP):
         in_dim = evecs_A.shape[0]
         out_dim = evecs_G.shape[0]
 
-        # Reshape v to matrix form
+        # Reshape v to matrix form (in_dim, out_dim) - same as KFAC convention
         V = tf.reshape(v_block, (in_dim, out_dim))
 
         # Project to eigenbasis: V_kfe = U_A^T @ V @ U_G
+        # Result shape: (in_dim, out_dim)
         V_kfe = tf.matmul(tf.matmul(evecs_A, V, transpose_a=True), evecs_G)
 
         # Solve in eigenbasis (element-wise division)
-        # Note: evals is (out_dim, in_dim), V_kfe is (in_dim, out_dim)
+        # evals is (out_dim, in_dim), V_kfe is (in_dim, out_dim)
+        # We need to transpose evals to match V_kfe shape
         evals_T = tf.transpose(evals)  # (in_dim, out_dim)
         X_kfe = V_kfe / (evals_T + damping)
 
@@ -1720,6 +2106,7 @@ class EKFACIHVP(KFACIHVP):
         X_kfe = tf.where(tf.math.is_finite(X_kfe), X_kfe, tf.zeros_like(X_kfe))
 
         # Project back: X = U_A @ X_kfe @ U_G^T
+        # Result shape: (in_dim, out_dim)
         X = tf.matmul(tf.matmul(evecs_A, X_kfe), evecs_G, transpose_b=True)
 
         return tf.reshape(X, [-1])
@@ -1764,7 +2151,7 @@ class EKFACIHVP(KFACIHVP):
                 evecs_A, evecs_G = self.evecs[layer_idx]
                 evals = self.evals[layer_idx]
 
-                x_block = self._solve_ekfac_block(evecs_A, evecs_G, evals, v_block, self.damping)
+                x_block = self._solve_ekfac_block(evecs_A, evecs_G, evals, v_block, self.regul)
 
                 ihvp_sample.append(x_block)
                 param_idx += n_params

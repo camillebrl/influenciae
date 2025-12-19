@@ -57,7 +57,7 @@ venv.bak/
 /site
 
 # notebooks and lab
-notebooks/
+# notebooks/
 lab/
 
 # ide

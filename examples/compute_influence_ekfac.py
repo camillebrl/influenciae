@@ -1,3 +1,10 @@
+"""
+Script pour calculer l'influence sur un MLP avec EKFAC.
+
+EKFAC (Eigenvalue-corrected KFAC) est une amélioration de KFAC qui corrige
+les valeurs propres en utilisant les statistiques de gradient exactes.
+"""
+
 import re
 import numpy as np
 import tensorflow as tf
@@ -9,20 +16,19 @@ import torch
 from tqdm import tqdm
 from typing import Optional, Tuple, Dict, Any
 
-from deel.influenciae.common import InfluenceModel, FisherIHVP
+from deel.influenciae.common import InfluenceModel, EKFACIHVP
 from deel.influenciae.influence import FirstOrderInfluenceCalculator
 from deel.influenciae.utils import ORDER
 
-
-MLP_PATH = "models/notam_mlp_avgemb.pt"
+MLP_PATH = "../models/notam_mlp_avgemb.pt"
 DATASET_NAME = "DEEL-AI/NOTAM"
 BATCH_SIZE = 32
 
-# Paramètres d'analyse d'influence
+# Parametres d'analyse d'influence
 NUM_TRAIN_SAMPLES = None  # None = tous, ou un entier pour limiter
-NUM_TEST_SAMPLES = 1     # Nombre d'exemples test à analyser
-TOP_K = 5                 # Nombre d'exemples influents à afficher
-BATCH_SIZE_HESSIAN = 4    # Petit batch pour le calcul de la Hessienne (évite OOM)
+NUM_TEST_SAMPLES = 1     # Nombre d'exemples test a analyser
+TOP_K = 5                 # Nombre d'exemples influents a afficher
+BATCH_SIZE_HESSIAN = 4    # Petit batch pour le calcul de la Hessienne (evite OOM)
 N_SAMPLES_HESSIAN = None  # Nombre d'exemples pour estimer la Hessienne (None = tous)
 
 TOKEN_PATTERN = re.compile(r"\w+")
@@ -31,7 +37,6 @@ TOKEN_PATTERN = re.compile(r"\w+")
 def tokenize(text: str) -> list:
     """Tokenisation simple."""
     return TOKEN_PATTERN.findall(text.lower())
-
 
 def text_to_avg_embedding(text: str, wv, dim: int) -> np.ndarray:
     """Convertit un texte en embedding moyen GloVe."""
@@ -44,7 +49,6 @@ def text_to_avg_embedding(text: str, wv, dim: int) -> np.ndarray:
         return np.zeros(dim, dtype=np.float32)
     return np.mean(vecs, axis=0).astype(np.float32)
 
-
 def extract_glove_embeddings(
     dataset,
     wv,
@@ -52,7 +56,7 @@ def extract_glove_embeddings(
     num_samples: Optional[int] = None
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Extrait les embeddings GloVe moyennés pour un dataset.
+    Extrait les embeddings GloVe moyennes pour un dataset.
     """
     if num_samples is not None:
         dataset = dataset.select(range(min(num_samples, len(dataset))))
@@ -76,9 +80,9 @@ def extract_glove_embeddings(
 
 def create_tf_mlp(emb_dim: int, hidden_dim: int, num_classes: int) -> Model:
     """
-    Crée un MLP TensorFlow équivalent au MLP PyTorch.
+    Cree un MLP TensorFlow equivalent au MLP PyTorch.
     Architecture: Linear(emb_dim, hidden_dim) -> ReLU -> Linear(hidden_dim, num_classes)
-    Note: On ignore le Dropout pour l'inférence.
+    Note: On ignore le Dropout pour l'inference.
     """
     inputs = layers.Input(shape=(emb_dim,), name="embeddings")
     x = layers.Dense(hidden_dim, activation="relu", name="hidden")(inputs)
@@ -90,13 +94,13 @@ def create_tf_mlp(emb_dim: int, hidden_dim: int, num_classes: int) -> Model:
 
 def transfer_mlp_weights(pt_checkpoint: dict, tf_model: Model) -> None:
     """
-    Transfère les poids du MLP PyTorch vers le modèle TensorFlow.
+    Transfere les poids du MLP PyTorch vers le modele TensorFlow.
     """
     print("Transfert des poids PyTorch -> TensorFlow...")
 
     state_dict = pt_checkpoint["model_state_dict"]
 
-    # Couche cachée (net.0)
+    # Couche cachee (net.0)
     hidden_weight = state_dict["net.0.weight"].numpy()  # (hidden_dim, emb_dim)
     hidden_bias = state_dict["net.0.bias"].numpy()      # (hidden_dim,)
     # Keras attend (emb_dim, hidden_dim), donc on transpose
@@ -107,14 +111,14 @@ def transfer_mlp_weights(pt_checkpoint: dict, tf_model: Model) -> None:
     output_bias = state_dict["net.3.bias"].numpy()      # (num_classes,)
     tf_model.get_layer("classifier").set_weights([output_weight.T, output_bias])
 
-    print("Poids transférés avec succès!")
+    print("Poids transferes avec succes!")
 
 def prepare_tf_dataset(
     embeddings: np.ndarray,
     labels: np.ndarray,
     batch_size: int = 32
 ) -> tf.data.Dataset:
-    """Prépare un tf.data.Dataset batché pour influenciae."""
+    """Prepare un tf.data.Dataset batche pour influenciae."""
     dataset = tf.data.Dataset.from_tensor_slices((
         tf.constant(embeddings, dtype=tf.float32),
         tf.constant(labels, dtype=tf.int32)
@@ -124,12 +128,12 @@ def prepare_tf_dataset(
 
 
 def process_batch_for_loss(batch):
-    """Fonction de prétraitement du batch pour influenciae."""
+    """Fonction de pretraitement du batch pour influenciae."""
     inputs, labels = batch
     sample_weights = tf.ones_like(labels, dtype=tf.float32)
     return inputs, labels, sample_weights
 
-def compute_influence_with_influenciae(
+def compute_influence_with_ekfac(
     tf_model: Model,
     train_embeddings: np.ndarray,
     train_labels: np.ndarray,
@@ -141,17 +145,20 @@ def compute_influence_with_influenciae(
     top_k: int = 5
 ) -> Dict[str, Any]:
     """
-    Calcule les scores d'influence en utilisant influenciae.
+    Calcule les scores d'influence en utilisant influenciae avec EKFAC.
+
+    EKFAC utilise le pi-damping interne pour la regularisation,
+    donc aucun parametre de damping n'est necessaire.
     """
     print(f"\n{'='*60}")
-    print("Calcul d'influence avec influenciae (FirstOrderInfluenceCalculator)")
+    print("Calcul d'influence avec influenciae (EKFAC)")
     print(f"{'='*60}")
 
-    # Préparer les datasets TensorFlow
+    # Preparer les datasets TensorFlow
     train_dataset = prepare_tf_dataset(train_embeddings, train_labels, batch_size)
     test_dataset = prepare_tf_dataset(test_embeddings, test_labels, batch_size)
 
-    # Dataset séparé pour le calcul de la Hessienne (petit batch, subset)
+    # Dataset separe pour le calcul de la Hessienne (petit batch, subset)
     if n_samples_hessian is not None:
         hessian_embeddings = train_embeddings[:n_samples_hessian]
         hessian_labels = train_labels[:n_samples_hessian]
@@ -160,43 +167,42 @@ def compute_influence_with_influenciae(
         hessian_labels = train_labels
     hessian_dataset = prepare_tf_dataset(hessian_embeddings, hessian_labels, batch_size_hessian)
 
-    # Loss function SANS réduction (requis par influenciae)
+    # Loss function SANS reduction (requis par influenciae)
     loss_fn = SparseCategoricalCrossentropy(from_logits=True, reduction=Reduction.NONE)
 
-    # Wrapper le modèle avec InfluenceModel
-    # On surveille TOUS les poids du MLP (pas seulement la dernière couche)
+    # Wrapper le modele avec InfluenceModel
+    # On surveille TOUS les poids du MLP (pas seulement la derniere couche)
     influence_model = InfluenceModel(
         tf_model,
-        start_layer=1,   # Première couche Dense (hidden)
-        last_layer=-1,   # Dernière couche Dense (classifier)
+        start_layer=1,   # Premiere couche Dense (hidden)
+        last_layer=-1,   # Derniere couche Dense (classifier)
         loss_function=loss_fn,
         process_batch_for_loss_fn=process_batch_for_loss
     )
 
-    # Calculateur IHVP avec Fisher (Gauss-Newton approximation)
-    print("Création du calculateur IHVP (Fisher)...")
-    print(f"Nombre de paramètres surveillés: {influence_model.nb_params}")
+    # Calculateur IHVP avec EKFAC
+    # - update_eigen=True: utilise les eigenvalues corrigees (plus precis)
+    # - Pas de parametre damping: EKFAC utilise le pi-damping interne
+    print("Creation du calculateur IHVP (EKFAC)...")
+    print(f"Nombre de parametres surveilles: {influence_model.nb_params}")
     print(f"Exemples pour Hessienne: {len(hessian_embeddings)}, batch_size: {batch_size_hessian}")
 
-    # For a small MLP, we don't need extractor_layer - compute Fisher on all params
-    ihvp_calculator = FisherIHVP(
+    ihvp_calculator = EKFACIHVP(
         model=influence_model,
         train_dataset=hessian_dataset,
-        damping=1e-3  # Increase damping for better numerical stability
+        update_eigen=True  # Mise a jour des eigenvalues pour plus de precision
     )
 
-    # Diagnostic: check Fisher matrix properties
-    print(f"Fisher shape: {ihvp_calculator.fisher.shape}")
-    print(f"Fisher min: {tf.reduce_min(ihvp_calculator.fisher).numpy():.6e}")
-    print(f"Fisher max: {tf.reduce_max(ihvp_calculator.fisher).numpy():.6e}")
-    print(f"Fisher has NaN: {tf.reduce_any(tf.math.is_nan(ihvp_calculator.fisher)).numpy()}")
-    print(f"Fisher has Inf: {tf.reduce_any(tf.math.is_inf(ihvp_calculator.fisher)).numpy()}")
-    print(f"Inv Fisher min: {tf.reduce_min(ihvp_calculator.inv_fisher).numpy():.6e}")
-    print(f"Inv Fisher max: {tf.reduce_max(ihvp_calculator.inv_fisher).numpy():.6e}")
-    print(f"Inv Fisher has NaN: {tf.reduce_any(tf.math.is_nan(ihvp_calculator.inv_fisher)).numpy()}")
-    print(f"Inv Fisher has Inf: {tf.reduce_any(tf.math.is_inf(ihvp_calculator.inv_fisher)).numpy()}")
+    # Diagnostic: check EKFAC blocks properties
+    for layer_idx, (A, G) in ihvp_calculator.kfac_blocks.items():
+        layer_info = ihvp_calculator.layer_info[layer_idx]
+        evals = ihvp_calculator.evals[layer_idx]
+        print(f"Layer {layer_idx} ({layer_info['layer'].name}):")
+        print(f"  A shape: {A.shape}, min: {tf.reduce_min(A).numpy():.6e}, max: {tf.reduce_max(A).numpy():.6e}")
+        print(f"  G shape: {G.shape}, min: {tf.reduce_min(G).numpy():.6e}, max: {tf.reduce_max(G).numpy():.6e}")
+        print(f"  Eigenvalues shape: {evals.shape}, min: {tf.reduce_min(evals).numpy():.6e}, max: {tf.reduce_max(evals).numpy():.6e}")
 
-    print("Création du FirstOrderInfluenceCalculator...")
+    print("Creation du FirstOrderInfluenceCalculator...")
     influence_calculator = FirstOrderInfluenceCalculator(
         influence_model,
         train_dataset,
@@ -204,6 +210,7 @@ def compute_influence_with_influenciae(
     )
 
     # Diagnostic: Test computing influence vector for one batch
+    print("\n=== Diagnostic: Influence vector computation ===")
     for batch in train_dataset.take(1):
         # Test batch_jacobian_tensor
         test_jacobian = influence_model.batch_jacobian_tensor(batch)
@@ -239,7 +246,7 @@ def compute_influence_with_influenciae(
         order=ORDER.DESCENDING
     )
 
-    # Collecter les résultats positifs
+    # Collecter les resultats positifs
     results = {
         "test_embeddings": [],
         "test_labels": [],
@@ -262,8 +269,8 @@ def compute_influence_with_influenciae(
         else:
             results["top_k_train_samples"].append(training_samples.numpy())
 
-    # Calculer le top-k des exemples avec influence négative (opponents)
-    print(f"\nRecherche des top-{top_k} exemples avec influence négative (opponents)...")
+    # Calculer le top-k des exemples avec influence negative (opponents)
+    print(f"\nRecherche des top-{top_k} exemples avec influence negative (opponents)...")
 
     top_k_negative = influence_calculator.top_k(
         test_dataset,
@@ -290,7 +297,7 @@ def find_train_indices(
     train_embeddings: np.ndarray
 ) -> np.ndarray:
     """
-    Retrouve les indices des exemples train à partir de leurs embeddings.
+    Retrouve les indices des exemples train a partir de leurs embeddings.
     """
     # Calcul de distance euclidienne
     # top_k_embeddings: (top_k, emb_dim)
@@ -312,10 +319,10 @@ def display_influence_results(
     top_k: int = 5
 ):
     """
-    Affiche les résultats d'influence de manière lisible.
+    Affiche les resultats d'influence de maniere lisible.
     """
     print(f"\n{'='*80}")
-    print("RÉSULTATS D'INFLUENCE (Fisher)")
+    print("RESULTATS D'INFLUENCE (EKFAC)")
     print(f"{'='*80}")
 
     test_idx = 0
@@ -352,14 +359,14 @@ def display_influence_results(
                 print(f"  Score d'influence: {score:.6f}")
                 print(f"  Train idx: {train_idx}")
                 print(f"  Label: {train_example['label']} ({label_names[train_example['label']]})")
-                print(f"  Texte: {train_example['text'][:200]}...")
+                print(f"  Texte: {train_example['text']}...")
 
-            # Afficher les opponents (influence négative)
+            # Afficher les opponents (influence negative)
             inf_vals_neg = bottom_k_values[i]
             train_embs_neg = bottom_k_train_emb[i]
             train_indices_neg = find_train_indices(train_embs_neg, train_embeddings)
 
-            print(f"\n--- Top {top_k} exemples avec influence NÉGATIVE (opponents) ---")
+            print(f"\n--- Top {top_k} exemples avec influence NEGATIVE (opponents) ---")
 
             for rank in range(min(top_k, len(inf_vals_neg))):
                 score = inf_vals_neg[rank]
@@ -370,22 +377,23 @@ def display_influence_results(
                 print(f"  Score d'influence: {score:.6f}")
                 print(f"  Train idx: {train_idx}")
                 print(f"  Label: {train_example['label']} ({label_names[train_example['label']]})")
-                print(f"  Texte: {train_example['text'][:200]}...")
+                print(f"  Texte: {train_example['text']}...")
 
             test_idx += 1
 
             if test_idx >= 5:
-                print("\n... (affichage limité aux 5 premiers exemples)")
+                print("\n... (affichage limite aux 5 premiers exemples)")
                 return
 
 
 def main():
     print("="*60)
     print("ANALYSE D'INFLUENCE - MLP sur NOTAM (embeddings GloVe)")
+    print("Methode: EKFAC (Eigenvalue-corrected KFAC)")
     print("="*60)
 
     # Charger le checkpoint PyTorch
-    print(f"\nChargement du modèle MLP: {MLP_PATH}")
+    print(f"\nChargement du modele MLP: {MLP_PATH}")
     checkpoint = torch.load(MLP_PATH, map_location="cpu")
 
     emb_dim = checkpoint["emb_dim"]
@@ -425,15 +433,15 @@ def main():
         num_samples=NUM_TEST_SAMPLES
     )
 
-    # Créer le modèle TensorFlow
-    print("\nCréation du modèle TensorFlow...")
+    # Creer le modele TensorFlow
+    print("\nCreation du modele TensorFlow...")
     tf_model = create_tf_mlp(emb_dim, hidden_dim, num_classes)
     tf_model.summary()
 
-    # Transférer les poids
+    # Transferer les poids
     transfer_mlp_weights(checkpoint, tf_model)
 
-    # Vérifier que le modèle fonctionne
+    # Verifier que le modele fonctionne
     tf_model.compile(
         optimizer="adam",
         loss=SparseCategoricalCrossentropy(from_logits=True),
@@ -443,10 +451,10 @@ def main():
     # Test rapide sur les embeddings de test
     test_ds = prepare_tf_dataset(test_embeddings, test_labels, BATCH_SIZE)
     loss, acc = tf_model.evaluate(test_ds, verbose=0)
-    print(f"Vérification - Loss: {loss:.4f}, Accuracy: {acc:.4f}")
+    print(f"Verification - Loss: {loss:.4f}, Accuracy: {acc:.4f}")
 
-    # Calculer l'influence avec influenciae
-    results = compute_influence_with_influenciae(
+    # Calculer l'influence avec EKFAC
+    results = compute_influence_with_ekfac(
         tf_model,
         train_embeddings,
         train_labels,
@@ -469,7 +477,7 @@ def main():
     else:
         test_subset = test_dataset
 
-    # Afficher les résultats
+    # Afficher les resultats
     display_influence_results(
         results,
         train_subset,
@@ -480,7 +488,7 @@ def main():
     )
 
     print("\n" + "="*60)
-    print("Analyse terminée!")
+    print("Analyse terminee!")
     print("="*60)
 
 

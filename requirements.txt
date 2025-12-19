@@ -2,3 +2,5 @@ tensorflow
 numpy
 matplotlib
 torch
+nnsight
+nngeometry # pour les tests de comparaison

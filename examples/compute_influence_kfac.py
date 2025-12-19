@@ -13,7 +13,7 @@ from deel.influenciae.common import InfluenceModel, KFACIHVP
 from deel.influenciae.influence import FirstOrderInfluenceCalculator
 from deel.influenciae.utils import ORDER
 
-MLP_PATH = "models/notam_mlp_avgemb.pt"
+MLP_PATH = "../models/notam_mlp_avgemb.pt"
 DATASET_NAME = "DEEL-AI/NOTAM"
 BATCH_SIZE = 32
 
@@ -177,8 +177,7 @@ def compute_influence_with_influenciae(
 
     ihvp_calculator = KFACIHVP(
         model=influence_model,
-        train_dataset=hessian_dataset,
-        damping=1e-3  # Régularisation pour stabilité numérique
+        train_dataset=hessian_dataset
     )
 
     # Diagnostic: check KFAC blocks properties
@@ -346,7 +345,7 @@ def display_influence_results(
                 print(f"  Score d'influence: {score:.6f}")
                 print(f"  Train idx: {train_idx}")
                 print(f"  Label: {train_example['label']} ({label_names[train_example['label']]})")
-                print(f"  Texte: {train_example['text'][:200]}...")
+                print(f"  Texte: {train_example['text']}...")
 
             # Afficher les opponents (influence négative)
             inf_vals_neg = bottom_k_values[i]
@@ -364,7 +363,7 @@ def display_influence_results(
                 print(f"  Score d'influence: {score:.6f}")
                 print(f"  Train idx: {train_idx}")
                 print(f"  Label: {train_example['label']} ({label_names[train_example['label']]})")
-                print(f"  Texte: {train_example['text'][:200]}...")
+                print(f"  Texte: {train_example['text']}...")
 
             test_idx += 1
 
